@@ -18,31 +18,26 @@ type SignedEndorsement struct {
 	Sig [65]byte
 }
 
-// SignedEncode encode and sign an endorsment
-func (e *SignedEndorsement) SignedEncode(c CipherSuite, rlp RLPEncoder, k *ecdsa.PrivateKey) ([]byte, error) {
+// EncodeSignEndorsement encode and sign an endorsment
+func (codec *CipherCodec) EncodeSignEndorsement(e *SignedEndorsement, k *ecdsa.PrivateKey) ([]byte, error) {
 
 	var err error
 	var b []byte
-	e.Sig, b, err = SignedEncode(c, rlp, k, &e.Endorsement)
+	e.Sig, b, err = codec.SignedEncode(k, e.Endorsement)
 
 	return b, err
 }
 
-// VerifyNodeSig verifies that the supplied node id signed the endorsement
-func (e *SignedEndorsement) VerifyNodeSig(c CipherSuite, rlp RLPEncoder, nodeID Hash) (bool, error) {
-	return VerifyNodeSignedEncoding(c, rlp, nodeID, e.Sig[:], &e.Endorsement)
-}
-
 // DecodeSigned decodes the endorsment and returns the signers ecrecovered public key
-func (e *SignedEndorsement) DecodeSigned(c CipherSuite, rlp RLPDecoder, b []byte) ([]byte, error) {
+func (codec *CipherCodec) DecodeSignedEndorsement(e *SignedEndorsement, b []byte) ([]byte, error) {
 
-	sig, pub, body, err := DecodeSigned(c, rlp.ByteStream(b))
+	sig, pub, body, err := codec.DecodeSigned(b)
 	if err != nil {
 		return nil, err
 	}
 	e.Sig = sig
 
-	if err = rlp.DecodeBytes(body, &e.Endorsement); err != nil {
+	if err = codec.DecodeBytes(body, &e.Endorsement); err != nil {
 		return nil, err
 	}
 	return pub, nil

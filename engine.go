@@ -69,9 +69,7 @@ type Broadcaster interface {
 // Engine implements consensus.Engine using Robust Round Robin consensus
 // https://arxiv.org/abs/1804.07391
 type Engine struct {
-	c          CipherSuite
-	rlpEncoder RLPEncoder
-	rlpDecoder RLPDecoder
+	codec *CipherCodec
 
 	// Don't change these while the engine is running
 	config     *Config
@@ -128,7 +126,7 @@ func (e *Engine) NodeAddress() Address {
 
 // NodePublic returns the marshaled public key. (uncompressed form specified in section 4.3.6 of ANSI X9.62)
 func (e *Engine) NodePublic() []byte {
-	return PubMarshal(e.c, &e.r.privateKey.PublicKey)
+	return PubMarshal(e.codec.c, &e.r.privateKey.PublicKey)
 }
 
 // IsRunning returns true if the engine is still running
@@ -145,7 +143,7 @@ func (e *Engine) IsEnrolmentPending(nodeID [32]byte) bool {
 // ConfigureNew a new instance of the rrr consensus engine. Assumes the provided
 // engine instance is new.
 func ConfigureNew(
-	e *Engine, config *Config, c CipherSuite, rlpDecoder RLPDecoder, rlpEncoder RLPEncoder,
+	e *Engine, config *Config, codec *CipherCodec,
 	privateKey *ecdsa.PrivateKey, logger Logger) {
 
 	if config.ConfirmPhase > config.RoundLength {
@@ -163,7 +161,7 @@ func ConfigureNew(
 	selfMessages, _ := lru.NewARC(lruMessages)
 	e.selfMessages = selfMessages
 
-	e.r = NewRoundState(c, rlpDecoder, rlpEncoder, privateKey, config, logger)
+	e.r = NewRoundState(codec, privateKey, config, logger)
 }
 
 // Start the consensus protocol. To allow for atomic cleanup, the caller
@@ -292,14 +290,16 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 
 	var err error
 
-	msgHash := Keccak256Hash(e.c, msg)
+	msgHash := Keccak256Hash(e.codec.c, msg)
 
 	rmsg := &RMsg{}
-	if err = e.rlpDecoder.DecodeBytes(msg, rmsg); err != nil {
+	if err = e.codec.DecodeBytes(msg, rmsg); err != nil {
 		return true, err
 	}
 
-	e.logger.Trace("RRR HandleMsg", "#msg", msgHash.Hex(), "#raw", Keccak256Hash(e.c, rmsg.Raw).Hex())
+	e.logger.Trace(
+		"RRR HandleMsg", "#msg", msgHash.Hex(),
+		"#raw", e.codec.Keccak256Hash(rmsg.Raw).Hex())
 
 	// Note: it is the msgHash we want here, not the raw hash. We want it to be
 	// possible for leader candidates to request a re-evaluation of the same
@@ -316,7 +316,7 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 
 		si := &EngSignedIntent{ReceivedAt: time.Now(), Seq: rmsg.Seq}
 
-		if si.Pub, err = si.DecodeSigned(e.c, e.rlpDecoder, rmsg.Raw); err != nil {
+		if si.Pub, err = e.codec.DecodeSignedIntent(&si.SignedIntent, rmsg.Raw); err != nil {
 			e.logger.Info("RRR Intent decodeverify failed", "err", err)
 			return true, err
 		}
@@ -332,7 +332,7 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 		e.logger.Trace("RRR HandleMsg - post engSignedEndorsement")
 		sc := &EngSignedEndorsement{ReceivedAt: time.Now(), Seq: rmsg.Seq}
 
-		if sc.Pub, err = sc.DecodeSigned(e.c, e.rlpDecoder, rmsg.Raw); err != nil {
+		if sc.Pub, err = e.codec.DecodeSignedEndorsement(&sc.SignedEndorsement, rmsg.Raw); err != nil {
 
 			e.logger.Debug("RRR Endorsement decodeverify failed", "err", err)
 			return true, err
@@ -357,7 +357,7 @@ func (e *Engine) FindPeers(
 func (e *Engine) Send(peerAddr Address, msg []byte) error {
 	e.logger.Trace("RRR Send")
 
-	msgHash := Keccak256Hash(e.c, msg)
+	msgHash := e.codec.Keccak256Hash(msg)
 
 	peers := e.peerFinder.FindPeers(map[Address]bool{peerAddr: true})
 	if len(peers) != 1 {
@@ -392,7 +392,9 @@ func (e *Engine) peerSend(
 	msgs.Add(msgHash, true)
 	e.peerMessages.Add(peerAddr, msgs)
 
-	e.logger.Trace("RRR peerSend - sending", "hash", msgHash.Hex(), "safe-hash", Keccak256Hash(e.c, msg).Hex())
+	e.logger.Trace(
+		"RRR peerSend - sending", "hash", msgHash.Hex(),
+		"safe-hash", e.codec.Keccak256Hash(msg).Hex())
 
 	// Send will error imediately on encoding problems. But otherwise it
 	// will block until the receiver consumes the message or the send times
@@ -405,7 +407,7 @@ func (e *Engine) peerSend(
 // previously sent the message to a peer, it is not resent.
 func (e *Engine) Broadcast(self Address, peers map[Address]Peer, msg []byte) error {
 
-	msgHash := Keccak256Hash(e.c, msg)
+	msgHash := e.codec.Keccak256Hash(msg)
 
 	for peerAddr, peer := range peers {
 
@@ -432,7 +434,7 @@ func (e *Engine) SendSignedEndorsement(intenderAddr Address, et *EngSignedIntent
 	}
 
 	var err error
-	c.IntentHash, err = et.SignedIntent.Hash(e.c, e.rlpEncoder)
+	c.IntentHash, err = e.codec.HashIntent(&et.SignedIntent.Intent)
 	if err != nil {
 		return err
 	}
@@ -441,12 +443,13 @@ func (e *Engine) SendSignedEndorsement(intenderAddr Address, et *EngSignedIntent
 	// will be changing the round also, we can be sure we will reply even if
 	// the intent is otherwise a duplicate.
 	rmsg := &RMsg{Code: RMsgConfirm, Seq: et.Seq}
-	rmsg.Raw, err = c.SignedEncode(e.c, e.rlpEncoder, e.privateKey)
+
+	rmsg.Raw, err = e.codec.EncodeSignEndorsement(c, e.privateKey)
 	if err != nil {
 		e.logger.Info("RRR encoding SignedEndorsement", "err", err.Error())
 		return err
 	}
-	msg, err := e.rlpEncoder.EncodeToBytes(rmsg)
+	msg, err := e.codec.EncodeToBytes(rmsg)
 	if err != nil {
 		e.logger.Info("RRR encoding RMsgConfirm", "err", err.Error())
 		return err
@@ -551,7 +554,7 @@ func (e *Engine) VerifyBranchHeaders(
 // engine is based on signatures.
 func (e *Engine) Author(header BlockHeader) (Address, error) {
 
-	_, sealerID, _, err := DecodeHeaderSeal(e.c, e.rlpDecoder, header)
+	_, sealerID, _, err := e.codec.DecodeHeaderSeal(header)
 	if err != nil {
 		return Address{}, err
 	}

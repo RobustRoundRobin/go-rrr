@@ -25,15 +25,16 @@ type Intent struct {
 }
 
 // Hash hashes the intent
-func (i *Intent) Hash(c CipherSuite, rlp RLPEncoder) (Hash, error) {
+func (codec *CipherCodec) HashIntent(i *Intent) (Hash, error) {
+
 	var err error
 	var b []byte
-	if b, err = rlp.EncodeToBytes(i); err != nil {
+	if b, err = codec.EncodeToBytes(i); err != nil {
 		return Hash{}, err
 	}
 
 	h := Hash{}
-	copy(h[:], c.Keccak256(b))
+	copy(h[:], codec.c.Keccak256(b))
 	return h, nil
 }
 
@@ -44,29 +45,28 @@ type SignedIntent struct {
 	Sig [65]byte
 }
 
-// SignedEncode rlp encodes the intent body, signs the result and returns the
-// RLP encoding of the result. c will typically be a leader candidate private
-// key.
-func (i *SignedIntent) SignedEncode(
-	c CipherSuite, rlp RLPEncoder, k *ecdsa.PrivateKey) ([]byte, error) {
+// EncodSignIntent encodes the intent body, signs the result and returns the
+// serialised encoding of the result. k will typically be a leader candidate
+// private key.
+func (codec *CipherCodec) EncodeSignIntent(i *SignedIntent, k *ecdsa.PrivateKey) ([]byte, error) {
 
 	var err error
 	var b []byte
-	i.Sig, b, err = SignedEncode(c, rlp, k, &i.Intent)
+	i.Sig, b, err = codec.SignedEncode(k, &i.Intent)
 	return b, err
 }
 
-// DecodeSigned decodes ...
-func (i *SignedIntent) DecodeSigned(c CipherSuite, rlp RLPDecoder, b []byte) ([]byte, error) {
+// DecodeSigned decodes ... (does not verify)
+func (codec *CipherCodec) DecodeSignedIntent(i *SignedIntent, b []byte) ([]byte, error) {
 
-	sig, pub, body, err := DecodeSigned(c, rlp.ByteStream(b))
+	sig, pub, body, err := codec.DecodeSigned(b)
 	if err != nil {
 		return nil, err
 	}
 	i.Sig = sig
 
 	// Do the defered decoding of the Intent now we have verified the sig
-	if err = rlp.DecodeBytes(body, &i.Intent); err != nil {
+	if err = codec.DecodeBytes(body, &i.Intent); err != nil {
 		return nil, err
 	}
 

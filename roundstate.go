@@ -63,12 +63,10 @@ type headerByNumberChainReader interface {
 type EndorsmentProtocol struct {
 	logger Logger
 
-	// The following interfaces give rrr the use of go-ethereum crypto and rlp
+	// The following interface give rrr the use of go-ethereum crypto and rlp
 	// primitives.  This arrangement avoids a circular dependency and licensing
 	// issues.
-	c          CipherSuite
-	rlpEncoder RLPEncoder
-	rlpDecoder RLPDecoder
+	codec *CipherCodec
 
 	// Node and chain context
 	config     *Config
@@ -119,19 +117,16 @@ type EndorsmentProtocol struct {
 
 // NewRoundState creates and initialises a RoundState
 func NewRoundState(
-	c CipherSuite, rlpDecoder RLPDecoder, rlpEncoder RLPEncoder,
-	key *ecdsa.PrivateKey, config *Config, logger Logger,
+	codec *CipherCodec, key *ecdsa.PrivateKey, config *Config, logger Logger,
 ) *EndorsmentProtocol {
 
 	s := &EndorsmentProtocol{
 		logger:     logger,
 		privateKey: key,
-		c:          c,
-		rlpEncoder: rlpEncoder,
-		rlpDecoder: rlpDecoder,
+		codec:      codec,
 
-		nodeID:   Pub2NodeID(c, &key.PublicKey),
-		nodeAddr: PubToAddress(c, &key.PublicKey),
+		nodeID:   NodeIDFromPub(codec.c, &key.PublicKey),
+		nodeAddr: PubToAddress(codec.c, &key.PublicKey),
 		config:   config,
 		vrf:      ecvrf.NewSecp256k1Sha256Tai(),
 		T:        NewRoundTime(config.RoundLength, config.ConfirmPhase, logger),
@@ -173,7 +168,7 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 		// geth implementation outside of our control.
 		seal := hg.GetSeal()
 		r.logger.Info("RRR CheckGenesis", "seal", hex.EncodeToString(seal))
-		err := r.rlpDecoder.DecodeBytes(seal, &r.genesisEx)
+		err := r.codec.ed.DecodeBytes(seal, &r.genesisEx)
 		if err != nil {
 			return err
 		}
@@ -181,8 +176,8 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 
 	// All of the enrolments in the genesis block are signed by the long term
 	// identity key (node key) of the genesis node.
-	ok, genPubBytes, err := VerifyRecoverNodeSig(
-		r.c, r.genesisEx.IdentInit[0].ID, r.genesisEx.IdentInit[0].U[:], r.genesisEx.IdentInit[0].Q[:])
+	ok, genPubBytes, err := r.codec.VerifyRecoverNodeSig(
+		r.genesisEx.IdentInit[0].ID, r.genesisEx.IdentInit[0].U[:], r.genesisEx.IdentInit[0].Q[:])
 	if err != nil || !ok {
 		return fmt.Errorf("genesis identity invalid signature: %w", errGensisIdentitiesInvalid)
 	}
@@ -192,7 +187,7 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 	for i, ident := range r.genesisEx.IdentInit {
 		a := r.genesisEx.Alpha[i]
 
-		if !VerifyNodeSig(r.c, ident.ID, a.Contribution[:], a.Sig[:]) {
+		if !r.codec.VerifyNodeSig(ident.ID, a.Contribution[:], a.Sig[:]) {
 			return fmt.Errorf(
 				"genesis identity [%d: %s] alpha sig verify failed: %w",
 				i, ident.ID.Hex(), errGensisIdentitiesInvalid)
@@ -202,7 +197,7 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 	alpha := hasher.Sum(nil)
 
 	// Now verify the seed was produced correctly by the genesis signer.
-	genPub, err := BytesToPublic(r.c, genPubBytes)
+	genPub, err := r.codec.BytesToPublic(genPubBytes)
 	if err != nil {
 		return fmt.Errorf("genesis identity failed to recover public key: %w", err)
 	}
@@ -233,7 +228,7 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 		return nil
 	}
 
-	r.a = NewActiveSelection(r.c, r.rlpDecoder, r.rlpEncoder, r.nodeID, r.logger)
+	r.a = NewActiveSelection(r.codec, r.nodeID, r.logger)
 	r.a.Reset(r.config.Activity, chain.CurrentHeader())
 
 	return nil
@@ -327,7 +322,7 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	// the node id declared in the intent
 
 	var recoveredNodeID Hash
-	if recoveredNodeID, err = PubBytes2NodeID(r.c, et.Pub); err != nil {
+	if recoveredNodeID, err = r.codec.NodeIDFromPubBytes(et.Pub); err != nil {
 		return err
 	}
 	intenderAddr := et.NodeID.Address()

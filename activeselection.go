@@ -79,9 +79,7 @@ type idActivity struct {
 // ActiveSelection tracks the active identities and facilitates ordering them by
 // age.
 type ActiveSelection struct {
-	c          CipherSuite
-	rlpDecoder RLPDecoder
-	rlpEncoder RLPEncoder
+	codec *CipherCodec
 
 	// activeSelection  is maintained in identity age order - with the youngest at
 	// the front.
@@ -110,12 +108,9 @@ type ActiveSelection struct {
 }
 
 func NewActiveSelection(
-	c CipherSuite, rlpDecoder RLPDecoder, rlpEncoder RLPEncoder,
-	selfNodeID Hash, logger Logger) *ActiveSelection {
+	codec *CipherCodec, selfNodeID Hash, logger Logger) *ActiveSelection {
 	a := &ActiveSelection{
-		c:          c,
-		rlpDecoder: rlpDecoder,
-		rlpEncoder: rlpEncoder,
+		codec:      codec,
 		selfNodeID: selfNodeID,
 		logger:     logger,
 	}
@@ -168,67 +163,6 @@ func (a *ActiveSelection) Prime(activity uint64, head BlockHeader) {
 // blockHeaderReader defines the interface required by AccumulateActive
 type blockHeaderReader interface {
 	GetHeaderByHash(hash [32]byte) BlockHeader
-}
-
-// BlockActivity is the decoded RRR consensus block activity data from the
-// block header extra data.
-type BlockActivity struct {
-	Confirm   []Endorsement
-	Enrol     []Enrolment
-	SealerID  Hash
-	SealerPub []byte
-}
-
-// Decode decodes the RRR consensus activity data from the header extra data.
-// Any activity previously held is completely discarded
-func (a *BlockActivity) Decode(c CipherSuite, rlpDecoder RLPDecoder, chainID Hash, header BlockHeader) error {
-
-	var err error
-	var se *SignedExtraData
-
-	a.Confirm = nil
-	a.Enrol = nil
-	a.SealerID = Hash{}
-	a.SealerPub = nil
-
-	// Common and fast path first
-	if header.GetNumber().Cmp(big0) > 0 {
-		se, a.SealerID, a.SealerPub, err = DecodeHeaderSeal(c, rlpDecoder, header)
-		if err != nil {
-			return err
-		}
-		a.Confirm = se.ExtraData.Confirm
-		a.Enrol = se.ExtraData.Enrol
-		return nil
-	}
-
-	// Genesis block needs special handling.
-	ge, err := DecodeGenesisExtra(rlpDecoder, header.GetSeal())
-	if err != nil {
-		return fmt.Errorf("%v: %w", err, ErrDecodingGenesisExtra)
-	}
-
-	// But do require consistency, if it has been previously decoded
-	h0 := Hash{}
-	if chainID != h0 && chainID != ge.ChainID {
-		return fmt.Errorf(
-			"genesis header with incorrect chainID: %w", ErrDecodingGenesisExtra)
-	}
-
-	// Get the genesis signer public key and node id. Do this derivation of
-	// node id and public key unconditionally regardless of wheter we think we
-	// have the information to hand - it is just safer that way.
-	a.SealerPub, err = c.Ecrecover(ge.IdentInit[0].U[:], ge.IdentInit[0].Q[:])
-	if err != nil {
-		return fmt.Errorf("%v:%w", err, errGensisIdentitiesInvalid)
-	}
-
-	copy(a.SealerID[:], c.Keccak256(a.SealerPub[1:65]))
-
-	a.Confirm = []Endorsement{}
-	a.Enrol = ge.IdentInit
-
-	return nil
 }
 
 // AccumulateActive is effectively SelectActive from the paper, but with the
@@ -304,7 +238,7 @@ func (a *ActiveSelection) AccumulateActive(
 				headNumber, head.Hash(), errBranchDetected)
 		}
 
-		if err = blockActivity.Decode(a.c, a.rlpDecoder, chainID, cur); err != nil {
+		if err = a.codec.DecodeBlockActivity(&blockActivity, chainID, cur); err != nil {
 			return err
 		}
 
@@ -642,7 +576,7 @@ func (a *ActiveSelection) enrolIdentities(
 		enbind.NodeID = e.ID
 		enbind.ReEnrol = reEnrol
 
-		u, err := enbind.U(a.c, a.rlpEncoder)
+		u, err := a.codec.HashEnrolmentBinding(enbind)
 		if err != nil {
 			return false, err
 		}
@@ -654,7 +588,7 @@ func (a *ActiveSelection) enrolIdentities(
 		}
 
 		// Did the block sealer sign the indidual enrolment.
-		if !a.c.VerifySignature(sealerPub, u[:], e.Q[:64]) {
+		if !a.codec.c.VerifySignature(sealerPub, u[:], e.Q[:64]) {
 			a.logger.Info("RRR enrolIdentities - verify failed",
 				"sealerID", sealerID.Hex(), "e.ID", e.ID.Hex(), "e.U", e.U.Hex())
 			return false, fmt.Errorf("sealer-id=`%s',id=`%s',u=`%s':%w",

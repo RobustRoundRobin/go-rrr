@@ -50,7 +50,7 @@ func (r *EndorsmentProtocol) VerifyBranchHeaders(
 			r.logger.Info(
 				"RRR VerifyBranchHeaders - genesis block", "seal",
 				hex.EncodeToString(seal))
-			err := r.rlpDecoder.DecodeBytes(seal, &r.genesisEx)
+			err := r.codec.DecodeBytes(seal, &r.genesisEx)
 			if err != nil {
 				return err
 			}
@@ -85,11 +85,11 @@ func (r *EndorsmentProtocol) VerifyHeader(chain headerByNumberChainReader, heade
 	}
 
 	// Check the seal (extraData) format is correct and signed
-	se, sealerID, pub, err := DecodeHeaderSeal(r.c, r.rlpDecoder, header)
+	se, sealerID, pub, err := r.codec.DecodeHeaderSeal(header)
 	if err != nil {
 		return nil, err
 	}
-	sealerPub, err := BytesToPublic(r.c, pub)
+	sealerPub, err := r.codec.BytesToPublic(pub)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +150,7 @@ func (r *EndorsmentProtocol) VerifyHeader(chain headerByNumberChainReader, heade
 		if stableHeader == nil {
 			return nil, fmt.Errorf("block at stablePrefixDepth not found: %d - %d", blockNumber, r.config.StablePrefixDepth)
 		}
-		se, _, _, err := DecodeHeaderSeal(r.c, r.rlpDecoder, stableHeader)
+		se, _, _, err := r.codec.DecodeHeaderSeal(stableHeader)
 		if err != nil {
 			return nil, fmt.Errorf("failed decoding stable header seal: %v", err)
 		}
@@ -170,7 +170,7 @@ func (r *EndorsmentProtocol) VerifyHeader(chain headerByNumberChainReader, heade
 
 	// Check all the endorsements. First check the intrinsic validity
 
-	intentHash, err := se.Intent.Hash(r.c, r.rlpEncoder)
+	intentHash, err := r.codec.HashIntent(&se.Intent)
 	if err != nil {
 		return se, err
 	}

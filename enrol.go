@@ -4,6 +4,7 @@ package rrr
 
 import (
 	"crypto/ecdsa"
+	"fmt"
 	"math/big"
 )
 
@@ -26,19 +27,23 @@ type Enrolment struct {
 	ID Hash // must be verified by re-creating an Enrol
 }
 
-// Fill intitialises a Quote for an identity to be enroled on the chain.
+// FillEnrolmentQuote intitialises a Quote for an identity to be enroled on the chain.
 // a is the attestor. For genesis enrolment, this should be the chain creators
 // private key.
 // u is the 'userdata' hash to attest. For genesis identity
 // enrolment it is just the enode identity directly (they are already 32 byte
 // hashes). For operational enrolment it the hash of the rlp encoded
 // EnrolmentBinding struct
-func (q *Quote) Fill(c CipherSuite, a *ecdsa.PrivateKey, u Hash) error {
+func (codec *CipherCodec) FillEnrolmentQuote(q []byte, u Hash, a *ecdsa.PrivateKey) error {
 
 	var err error
 	var b []byte
 
-	if b, err = c.Sign(u[:], a); err != nil {
+	if len(q) != 65 {
+		return fmt.Errorf("quote slice len %d, must be 65", len(q))
+	}
+
+	if b, err = codec.c.Sign(u[:], a); err != nil {
 		return err
 	}
 	copy(q[:], b[:])
@@ -46,21 +51,21 @@ func (q *Quote) Fill(c CipherSuite, a *ecdsa.PrivateKey, u Hash) error {
 	return nil
 }
 
-// EnrolIdentity fills in a quote for operational enrolment of the supplied
-// nodeid. This binds the enrolment to the chain identified by chainID. Round
-// is the current round of consensus. blockHash identifies the current head of
-// the chain (selected branch)
-func (q *Quote) EnrolIdentity(
-	c CipherSuite, rlp RLPEncoder, a *ecdsa.PrivateKey, chainID Hash, nodeid Hash, round *big.Int,
+// SignIdentityEnrolment fills in a quote for operational enrolment of the
+// supplied nodeid. This binds the enrolment to the chain identified by
+// chainID. Round is the current round of consensus. blockHash identifies the
+// current head of the chain (selected branch)
+func (codec *CipherCodec) SignEnrolmentBindingHash(
+	q *Quote, key *ecdsa.PrivateKey, chainID Hash, nodeid Hash, round *big.Int,
 	blockHash Hash, reEnrol bool,
 ) error {
-	e := EnrolmentBinding{
+	e := &EnrolmentBinding{
 		ChainID: chainID, NodeID: nodeid, Round: round, BlockHash: blockHash, ReEnrol: reEnrol}
-	u, err := e.U(c, rlp)
+	u, err := codec.HashEnrolmentBinding(e)
 	if err != nil {
 		return err
 	}
-	return q.Fill(c, a, u)
+	return codec.FillEnrolmentQuote(q[:], u, key)
 }
 
 // EnrolmentBinding is rlp encoded, hashed and signed to introduce NodeID as a
@@ -74,33 +79,33 @@ type EnrolmentBinding struct {
 }
 
 // U encodes the userdata hash to sign for the enrolment.
-func (e *EnrolmentBinding) U(c CipherSuite, rlp RLPEncoder) (Hash, error) {
+func (codec *CipherCodec) HashEnrolmentBinding(e *EnrolmentBinding) (Hash, error) {
 
 	u := Hash{}
-	b, err := rlp.EncodeToBytes(e)
+	b, err := codec.EncodeToBytes(e)
 	if err != nil {
 		return u, err
 	}
-	copy(u[:], c.Keccak256(b))
+	copy(u[:], codec.c.Keccak256(b))
 	return u, nil
 }
 
-// RecoverPublic recovers the attestors public key from the signature and the
-// attested userdata hash. For a genesis enrolment, that is just the nodeid
-// directly. For operational enrolments, obtain u by filling in the
-// EnrolementBinding type and calling U()
-func (q *Quote) RecoverPublic(c CipherSuite, u Hash) (*ecdsa.PublicKey, error) {
-	return RecoverPublic(c, u[:], q[:])
+// RecoverEnrolmentPublic recovers the public component of the key which signed
+// the enrolment from the signature q and and the userdata hash u. For a
+// genesis enrolment, that is just the nodeid directly. For operational
+// enrolments, obtain u by filling in the EnrolementBinding type and calling
+// HashEnrolmentBinding()
+func (codec *CipherCodec) RecoverEnrolmentPublic(q Quote, u Hash) (*ecdsa.PublicKey, error) {
+	return RecoverPublic(codec.c, u[:], q[:])
 }
 
-// RecoverID recovers the attestors identity from the signature and the
-// identity (public key) of the quoted node
-func (q *Quote) RecoverID(c CipherSuite, u Hash) (Hash, error) {
-	p, err := c.Ecrecover(u[:], q[:])
+// RecoverEnrolerID recovers the identity that signed the enrolment hash u.
+func (codec *CipherCodec) RecoverEnrolerID(q Quote, u Hash) (Hash, error) {
+	p, err := codec.c.Ecrecover(u[:], q[:])
 	if err != nil {
 		return Hash{}, err
 	}
 	id := Hash{}
-	copy(id[:], c.Keccak256(p[1:65]))
+	copy(id[:], codec.c.Keccak256(p[1:65]))
 	return id, nil
 }

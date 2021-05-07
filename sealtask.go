@@ -146,12 +146,13 @@ func (r *EndorsmentProtocol) newPendingIntent(
 			TxHash:         Hash(et.BlockHeader.GetTxHash()), // the hash is computed by NewBlock
 		},
 	}
-	pe.RMsg.Raw, err = pe.SI.SignedEncode(r.c, r.rlpEncoder, r.privateKey)
+
+	pe.RMsg.Raw, err = r.codec.EncodeSignIntent(pe.SI, r.privateKey)
 	if err != nil {
 		return nil, err
 	}
 
-	if pe.Msg, err = r.rlpEncoder.EncodeToBytes(pe.RMsg); err != nil {
+	if pe.Msg, err = r.codec.EncodeToBytes(pe.RMsg); err != nil {
 		return nil, err
 	}
 
@@ -213,7 +214,7 @@ func (r *EndorsmentProtocol) handleEndorsement(et *EngSignedEndorsement) error {
 		return nil
 	}
 
-	pendingIntentHash, err := r.intent.SI.Hash(r.c, r.rlpEncoder)
+	pendingIntentHash, err := r.codec.HashIntent(&r.intent.SI.Intent)
 	if err != nil {
 		return err
 	}
@@ -294,7 +295,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 		return false, nil
 	}
 
-	intentHash, err := r.intent.SI.Hash(r.c, r.rlpEncoder)
+	intentHash, err := r.codec.HashIntent(&r.intent.SI.Intent)
 	if err != nil {
 		return false, err
 	}
@@ -325,7 +326,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 	if r.config.StablePrefixDepth < blockNumber {
 
 		stableHeader := chain.GetHeaderByNumber(blockNumber - r.config.StablePrefixDepth)
-		se, _, _, err := DecodeHeaderSeal(r.c, r.rlpDecoder, stableHeader)
+		se, _, _, err := r.codec.DecodeHeaderSeal(stableHeader)
 		if err != nil {
 			return false, fmt.Errorf("failed decoding stable header seal: %v", err)
 		}
@@ -359,11 +360,11 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 		eb.Round.Set(r.Number)
 		eb.BlockHash = r.intent.SealHash
 
-		u, err := eb.U(r.c, r.rlpEncoder)
+		u, err := r.codec.HashEnrolmentBinding(eb)
 		if err != nil {
 			return false, err
 		}
-		data.Enrol[i].Q.Fill(r.c, r.privateKey, u) // faux attestation
+		r.codec.FillEnrolmentQuote(data.Enrol[i].Q[:], u, r.privateKey) // faux attestation
 		data.Enrol[i].U = u
 		data.Enrol[i].ID = eb.NodeID
 		r.logger.Debug("RRR sealCurrentBlock - adding enrolment", "id", eb.NodeID.Hex(), "seal#", eb.BlockHash.Hex(), "u", u.Hex())
@@ -371,7 +372,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 	}
 	r.pendingEnrolments = make(map[Hash]*EnrolmentBinding)
 
-	seal, err := data.SignedEncode(r.c, r.rlpEncoder, r.privateKey)
+	seal, err := r.codec.EncodeSignExtraData(data, r.privateKey)
 	if err != nil {
 		return false, err
 	}

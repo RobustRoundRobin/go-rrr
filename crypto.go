@@ -4,19 +4,22 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"math/big"
 )
 
-// Hash is a hash. We always work with Keccak256, same as ethereum
+// Hash is a hash. We always work with Keccak256 (draft sha3)
 type Hash [32]byte
 
 // Address is the ethereum style right most 20 bytes of Keccak256 (pub.X || pub.Y )
 type Address [20]byte
 
-// CipherSuite exists principally to avoid licensing issues and circular
-// dependencies on go-ethereum
-// Notice: This is assumed to be EC secp256k1 + legacy sha3
+// CipherSuite abstracts essential cryptographic primitives used by rrr. It
+// exists principally to avoid licensing issues and circular dependencies on
+// go-ethereum. Implementations are assumed to be EC secp256k1 + draft sha3.
+// This interface does not allow for algorithmic agility of any kind.
 type CipherSuite interface {
 	Curve() elliptic.Curve
 
@@ -63,13 +66,38 @@ func PubToAddress(c CipherSuite, pub *ecdsa.PublicKey) Address {
 	return a
 }
 
-// func
+// NodeIDBytesFromPub NodeID is Keccak256 (Pub.X || Pub.Y )
+// In contexts where we have the id and a signature, we can recover the pub key
+// of the signer using Ecrecover
+func NodeIDBytesFromPub(c CipherSuite, pub *ecdsa.PublicKey) []byte {
+	buf := make([]byte, 64)
+	ReadBits(pub.X, buf[:32])
+	ReadBits(pub.Y, buf[32:])
+	return c.Keccak256(buf)
+}
 
-// VerifyNodeSignature verifies if sig over digest was produced using the
+// NodeIDFromPubBytes gets a node id from the bytes of an ecdsa public key
+func NodeIDFromPubBytes(c CipherSuite, pub []byte) (Hash, error) {
+	if len(pub) != 65 {
+		return Hash{}, fmt.Errorf("raw pubkey must be 65 bytes long")
+	}
+	h := Hash{}
+	copy(h[:], c.Keccak256(pub[1:]))
+	return h, nil
+}
+
+// NodeIDFromPub gets a node id from an ecdsa pub key
+func NodeIDFromPub(c CipherSuite, pub *ecdsa.PublicKey) Hash {
+	h := Hash{}
+	copy(h[:], NodeIDBytesFromPub(c, pub))
+	return h
+}
+
+// VerifyNodeSig verifies if sig over digest was produced using the
 // private key corresponding to nodeID. We EC recover the public key from the
 // digest and the signature and then compare the hash of the recovered public
 // key with the node ID. As ethereum node identities are the hash of the node's
-// public key, This is equivelant to verification using the public key.
+// public key, this is equivelant to verification using the public key.
 //
 // https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm#Public_key_recovery:
 //
@@ -147,4 +175,44 @@ func BytesToPublic(c CipherSuite, b []byte) (*ecdsa.PublicKey, error) {
 		return nil, errors.New("invalid secp256k1 curve point")
 	}
 	return pub, nil
+}
+
+// Address gets an address from a hash
+func (h Hash) Address() Address {
+	a := Address{}
+	copy(a[:], h[12:])
+	return a
+}
+
+// Hex gets the hex string of the Hash
+func (h Hash) Hex() string {
+	return hex.EncodeToString(h[:])
+}
+
+// Hex gets the hex string for the Address
+func (a Address) Hex() string {
+	return hex.EncodeToString(a[:])
+}
+
+// SignerPub recovers the public key that signed h
+func (h Hash) SignerPub(c CipherSuite, sig []byte) (*ecdsa.PublicKey, error) {
+	return RecoverPublic(c, h[:], sig)
+}
+
+// NodeIDFromSig gets the recovers the signers node id  from the signature
+func (h Hash) NodeIDFromSig(c CipherSuite, sig []byte) (Hash, error) {
+	pub, err := h.SignerPub(c, sig)
+	if err != nil {
+		return Hash{}, err
+	}
+	return NodeIDFromPub(c, pub), nil
+}
+
+// EnodeIDFromSig recovers the enode id for the signer of the hash
+func (h Hash) EnodeIDFromSig(c CipherSuite, sig []byte) ([]byte, error) {
+	pub, err := RecoverPublic(c, h[:], sig)
+	if err != nil {
+		return nil, err
+	}
+	return elliptic.Marshal(c.Curve(), pub.X, pub.Y)[1:], nil
 }

@@ -350,7 +350,7 @@ func (r *EndorsmentProtocol) readHead(chain EngineChainReader, head BlockHeader)
 	var seed []byte
 	if blockNumber.Cmp(big0) > 0 {
 		// There is no RRR seal on the genesis block
-		se, _, _, err = DecodeHeaderSeal(r.c, r.rlpDecoder, head)
+		se, _, _, err = r.codec.DecodeHeaderSeal(head)
 		if err != nil {
 			return nil, 0, nil, nil, fmt.Errorf("RRR readHead decodeHeaderSeal: %v", err)
 		}

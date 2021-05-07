@@ -40,7 +40,7 @@ type ChainInit struct {
 // GenesisExtraData  adds the ChainID which is the hash of the ChainInit
 type GenesisExtraData struct {
 	ChainInit
-	ChainID Hash // EncodeRLP fills this in automatically
+	ChainID Hash // Hash of encoded ChainInit
 }
 
 // IdentInit creates, or extends, the identity initialisation vector for the
@@ -48,7 +48,7 @@ type GenesisExtraData struct {
 // identities. One or more nodeids are passed as the trailing parameters. The
 // updated init vector is returned. See EIP-rrr/extraData of Block0
 func IdentInit(
-	c CipherSuite, rlp RLPEncoder, ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...Hash) ([]Enrolment, error) {
+	codec *CipherCodec, ck *ecdsa.PrivateKey, init []Enrolment, nodeids ...Hash) ([]Enrolment, error) {
 
 	start := len(init)
 	init = append(init, make([]Enrolment, len(nodeids))...)
@@ -62,7 +62,7 @@ func IdentInit(
 	for i, id := range nodeids {
 
 		eb.NodeID = id
-		u, err := eb.U(c, rlp)
+		u, err := codec.HashEnrolmentBinding(eb)
 		if err != nil {
 			return nil, err
 		}
@@ -72,7 +72,8 @@ func IdentInit(
 		// whole block header. But we do it this way regardless - for alignment
 		// with future posibilities and because it is actually quite convenient
 		// in other places.
-		err = init[start+i].Q.Fill(c, ck, u)
+
+		err = codec.FillEnrolmentQuote(init[start+i].Q[:], u, ck)
 		if err != nil {
 			return init, err
 		}
@@ -85,10 +86,10 @@ func IdentInit(
 
 // Populate fills in a ChainInit ready for encoding in the genesis extraData
 // See EIP-rrr/extraData of Block0/9.
-func (ci *ChainInit) Populate(
-	c CipherSuite, ck *ecdsa.PrivateKey, initIdents []Enrolment, alphaContrib map[Hash]Alpha) error {
+func (codec *CipherCodec) PopulateChainInit(
+	ci *ChainInit, ck *ecdsa.PrivateKey, initIdents []Enrolment, alphaContrib map[Hash]Alpha) error {
 
-	signerNodeID := Pub2NodeID(c, &ck.PublicKey)
+	signerNodeID := NodeIDFromPub(codec.c, &ck.PublicKey)
 
 	// Convenience for single node and small networks. It will be counter
 	// productive, from a human security perspective, to require the genesis
@@ -99,7 +100,7 @@ func (ci *ChainInit) Populate(
 		if _, err := rand.Read(a.Contribution[:]); err != nil {
 			return err
 		}
-		b, err := c.Sign(a.Contribution[:], ck)
+		b, err := codec.c.Sign(a.Contribution[:], ck)
 		if err != nil {
 			return err
 		}
@@ -122,12 +123,12 @@ func (ci *ChainInit) Populate(
 			continue
 		}
 
-		pub, err := c.Ecrecover(a.Contribution[:], a.Sig[:])
+		pub, err := codec.c.Ecrecover(a.Contribution[:], a.Sig[:])
 		if err != nil {
 			return fmt.Errorf("recovering seed contribution for %s contrib=%s sig=%s: %w",
 				ident.ID.Hex(), a.Contribution.Hex(), hex.EncodeToString(a.Sig[:]), err)
 		}
-		nodeID, err := PubBytes2NodeID(c, pub)
+		nodeID, err := NodeIDFromPubBytes(codec.c, pub)
 		if err != nil {
 			return fmt.Errorf("getting nodeid from (sig recovered) pub for %s: %w", ident.ID.Hex(), err)
 		}
@@ -166,49 +167,62 @@ func (ci *ChainInit) Populate(
 }
 
 // ChainID returns the ChainID
-func (ci *ChainInit) ChainID(c CipherSuite, rlp RLPEncoder) (Hash, error) {
+func (codec *CipherCodec) ChainID(ci *ChainInit) (Hash, error) {
 
 	id := Hash{}
-	b, err := rlp.EncodeToBytes(ci)
+	b, err := codec.EncodeToBytes(ci)
 	if err != nil {
 		return id, err
 	}
-	copy(id[:], c.Keccak256(b))
+	copy(id[:], codec.c.Keccak256(b))
 	return id, err
 }
 
-// EncodeRLP encodes ...
-// XXX: XXX: TODO sort out encoding when we can't pass in c, rlp
-func (gd *GenesisExtraData) EncodeToBytes(c CipherSuite, rlp RLPEncoder) ([]byte, error) {
+type hashedEncoding struct {
+	Encoded []byte
+	Digest  [32]byte
+}
+
+// EncodeHashGenesisExtraData encodes
+func (codec *CipherCodec) EncodeHashGenesisExtraData(gd *GenesisExtraData) ([]byte, error) {
 
 	var err error
 	var b []byte
 
-	list := make([]interface{}, 2)
+	he := &hashedEncoding{}
 
-	if b, err = rlp.EncodeToBytes(gd.ChainInit); err != nil {
+	if he.Encoded, err = codec.EncodeToBytes(gd.ChainInit); err != nil {
 		return nil, err
 	}
-	list[0] = rlp.RawValue(b)
 
-	if b, err = rlp.EncodeToBytes(c.Keccak256(b)); err != nil {
+	copy(he.Digest[:], codec.c.Keccak256(he.Encoded))
+
+	if b, err = codec.EncodeToBytes(he); err != nil {
 		return nil, err
 	}
-	list[1] = rlp.RawValue(b)
-	return rlp.EncodeToBytes(list)
+	return b, nil
 }
 
 // DecodeGenesisExtra decodes the RRR genesis extra data
-func DecodeGenesisExtra(rlp RLPDecoder, genesisExtra []byte) (*GenesisExtraData, error) {
-	ge := &GenesisExtraData{}
-	err := rlp.DecodeBytes(genesisExtra, ge)
+func (codec *CipherCodec) DecodeGenesisExtra(genesisExtra []byte) (*GenesisExtraData, error) {
+
+	he := &hashedEncoding{}
+
+	err := codec.DecodeBytes(genesisExtra, he)
 	if err != nil {
 		return nil, err
 	}
+
+	ge := &GenesisExtraData{}
+
+	if err := codec.DecodeBytes(he.Encoded, &ge.ChainInit); err != nil {
+		return nil, err
+	}
+	copy(ge.ChainID[:], he.Digest[:])
 	return ge, nil
 }
 
-func DecodeHeaderSeal(c CipherSuite, rlp RLPDecoder, header BlockHeader) (*SignedExtraData, Hash, []byte, error) {
+func (codec *CipherCodec) DecodeHeaderSeal(header BlockHeader) (*SignedExtraData, Hash, []byte, error) {
 
 	var err error
 	var pub []byte
@@ -226,10 +240,10 @@ func DecodeHeaderSeal(c CipherSuite, rlp RLPDecoder, header BlockHeader) (*Signe
 
 	se := &SignedExtraData{}
 
-	if pub, err = se.DecodeSigned(c, rlp, seal); err != nil {
+	if pub, err = codec.DecodeSignedExtraData(se, seal); err != nil {
 		return nil, Hash{}, nil, err
 	}
-	sealerID, err = PubBytes2NodeID(c, pub)
+	sealerID, err = NodeIDFromPubBytes(codec.c, pub)
 	if err != nil {
 		return nil, Hash{}, nil, err
 	}
