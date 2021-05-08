@@ -33,13 +33,15 @@ func TestRoundTripChainID(t *testing.T) {
 	b, err := codec.EncodeHashGenesisExtraData(extra1)
 	require.Nil(err)
 
-	extra2, err := codec.DecodeGenesisExtra(b)
+	extra2 := &rrr.GenesisExtraData{}
+	err = codec.DecodeGenesisExtra(b, extra2)
 	require.Nil(err)
 
 	b, err = codec.EncodeHashGenesisExtraData(extra2)
 	require.Nil(err)
 
-	extra3, err := codec.DecodeGenesisExtra(b)
+	extra3 := &rrr.GenesisExtraData{}
+	err = codec.DecodeGenesisExtra(b, extra3)
 	require.Nil(err)
 
 	require.Equal(extra3.ChainID, extra2.ChainID, "extra data encoding  of chainid is incorrect")

@@ -50,7 +50,7 @@ func (r *EndorsmentProtocol) VerifyBranchHeaders(
 			r.logger.Info(
 				"RRR VerifyBranchHeaders - genesis block", "seal",
 				hex.EncodeToString(seal))
-			err := r.codec.DecodeBytes(seal, &r.genesisEx)
+			err := r.codec.DecodeGenesisExtra(seal, &r.genesisEx)
 			if err != nil {
 				return err
 			}

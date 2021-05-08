@@ -1,5 +1,3 @@
-// +build nocsecp
-
 package secp256k1suite
 
 import (

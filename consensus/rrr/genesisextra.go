@@ -204,22 +204,20 @@ func (codec *CipherCodec) EncodeHashGenesisExtraData(gd *GenesisExtraData) ([]by
 }
 
 // DecodeGenesisExtra decodes the RRR genesis extra data
-func (codec *CipherCodec) DecodeGenesisExtra(genesisExtra []byte) (*GenesisExtraData, error) {
+func (codec *CipherCodec) DecodeGenesisExtra(genesisExtra []byte, extra *GenesisExtraData) error {
 
 	he := &hashedEncoding{}
 
 	err := codec.DecodeBytes(genesisExtra, he)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	ge := &GenesisExtraData{}
-
-	if err := codec.DecodeBytes(he.Encoded, &ge.ChainInit); err != nil {
-		return nil, err
+	if err := codec.DecodeBytes(he.Encoded, &extra.ChainInit); err != nil {
+		return err
 	}
-	copy(ge.ChainID[:], he.Digest[:])
-	return ge, nil
+	copy(extra.ChainID[:], he.Digest[:])
+	return nil
 }
 
 func (codec *CipherCodec) DecodeHeaderSeal(header BlockHeader) (*SignedExtraData, Hash, []byte, error) {

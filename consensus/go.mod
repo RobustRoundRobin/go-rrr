@@ -1,7 +1,8 @@
 module github.com/RobustRoundRobin/go-rrr/consensus/rrr
 
 go 1.15
-
+// github.com/cloudflare/cloudflare-go v0.14.0 vs
+// github.com/cloudflare/cloudflare-go v0.10.2-0.20190916151808-a80f83b9add9
 require (
 	github.com/hashicorp/golang-lru v0.5.5-0.20210104140557-80c98217689d
 	github.com/vechain/go-ecvrf v0.0.0-20200326080414-5b7e9ee61906

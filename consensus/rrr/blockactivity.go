@@ -35,8 +35,8 @@ func (codec *CipherCodec) DecodeBlockActivity(a *BlockActivity, chainID Hash, he
 	}
 
 	// Genesis block needs special handling.
-	ge, err := codec.DecodeGenesisExtra(header.GetSeal())
-	if err != nil {
+	ge := &GenesisExtraData{}
+	if err = codec.DecodeGenesisExtra(header.GetSeal(), ge); err != nil {
 		return fmt.Errorf("%v: %w", err, ErrDecodingGenesisExtra)
 	}
 
