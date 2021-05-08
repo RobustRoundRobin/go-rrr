@@ -299,7 +299,7 @@ func (r *EndorsmentProtocol) nextRound(chain EngineChainReader, head BlockHeader
 	// round.
 	if err := r.a.AccumulateActive(
 		r.genesisEx.ChainID, r.config.Activity, chain, headBlock); err != nil {
-		if !errors.Is(err, errBranchDetected) {
+		if !errors.Is(err, ErrBranchDetected) {
 			r.logger.Info(
 				"RRR nextRound - accumulateActive failed", "err", err)
 			return nil, nil, nil, err

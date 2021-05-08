@@ -17,7 +17,7 @@ var (
 	errEnrolmentInvalid           = errors.New("identity enrolment could not be verified")
 	errGensisIdentitiesInvalid    = errors.New("failed to enrol the identities from the genesis block")
 	errEnrolmentNotSignedBySealer = errors.New("identity enrolment was not indidualy signed by the block sealer")
-	errBranchDetected             = errors.New("branch detected")
+	ErrBranchDetected             = errors.New("branch detected")
 	errInsuficientActiveIdents    = errors.New("not enough active identities found")
 	big0                          = big.NewInt(0)
 	zeroAddr                      = Address{}
@@ -115,6 +115,25 @@ func NewActiveSelection(
 		logger:     logger,
 	}
 	return a
+}
+
+// enumeration and access
+
+func (a *ActiveSelection) Len() int {
+	return a.activeSelection.Len()
+}
+
+func (a *ActiveSelection) LenAged() int {
+	return len(a.aged)
+}
+
+func (a *ActiveSelection) LenIdle() int {
+	return len(a.idlePool)
+}
+
+func (a *ActiveSelection) YoungestNodeID() Hash {
+
+	return a.activeSelection.Front().Value.(*idActivity).nodeID
 }
 
 // Reset resets and primes the active selection such that head - ta is the
@@ -235,7 +254,7 @@ func (a *ActiveSelection) AccumulateActive(
 			// re-order the whole list.
 			return fmt.Errorf(
 				"reached a lower block without matching hash of last seen, head-bn=%v, head-#=%s: %w",
-				headNumber, head.Hash(), errBranchDetected)
+				headNumber, head.Hash(), ErrBranchDetected)
 		}
 
 		if err = a.codec.DecodeBlockActivity(&blockActivity, chainID, cur); err != nil {
@@ -807,4 +826,42 @@ func (a *ActiveSelection) calcLeaderWindow(
 		"RRR calcLeaderWindow", "na", na, "f", failedAttempts, "nc+ne", nc+ne,
 		"max", max, "a", amod, "if", iFirstLeader)
 	return iFirstLeader, iLastLeader
+}
+
+// The cursor arrangement only exists to support testing
+type selectionCursor struct {
+	selection *list.List
+	cur       *list.Element
+}
+
+type ActivityCursor interface {
+	Back() ActivityCursor
+	Prev() ActivityCursor
+	NodeID() Hash
+}
+
+// NewActiveSelectionCursor creates a cursor over the active selection. This is
+// provided to facilitate testing from external packages. It may get withdrawn
+// without notice.
+func NewActiveSelectionCursor(a *ActiveSelection) ActivityCursor {
+	cur := &selectionCursor{selection: a.activeSelection}
+	return cur
+}
+
+func (cur *selectionCursor) Back() ActivityCursor {
+	cur.cur = cur.selection.Back()
+	return cur
+}
+
+func (cur *selectionCursor) Prev() ActivityCursor {
+	cur.cur = cur.cur.Prev()
+	if cur.cur == nil {
+		return nil
+	}
+	return cur
+}
+
+func (cur *selectionCursor) NodeID() Hash {
+	age := cur.cur.Value.(*idActivity)
+	return age.nodeID
 }
