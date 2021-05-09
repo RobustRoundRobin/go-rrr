@@ -162,13 +162,9 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 	}
 
 	if r.genesisEx.ChainID == zeroHash {
-		// geth warmup will call VerifyBranchHeaders on the genesis block
-		// before doing anything else. This guard simply avoids an anoying and
-		// redundant log message, whilst also guarding against changes in the
-		// geth implementation outside of our control.
-		seal := hg.GetSeal()
-		r.logger.Info("RRR CheckGenesis", "seal", hex.EncodeToString(seal))
-		err := r.codec.ed.DecodeBytes(seal, &r.genesisEx)
+		extra := hg.GetExtra()
+		r.logger.Info("RRR CheckGenesis", "extraData", hex.EncodeToString(extra))
+		err := r.codec.DecodeGenesisExtra(extra, &r.genesisEx)
 		if err != nil {
 			return err
 		}

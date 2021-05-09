@@ -12,4 +12,5 @@ type BlockHeader interface {
 	GetTime() uint64
 	GetSeal() []byte
 	GetNonce() [8]byte
+	GetExtra() []byte
 }

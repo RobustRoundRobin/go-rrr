@@ -14,7 +14,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/rlp"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/stretchr/testify/assert"
@@ -77,7 +76,7 @@ func TestDecodeActivity(t *testing.T) {
 	_, data = requireMakeSignedExtraData(t,
 		keys[0], 0, intent, []*rrr.SignedEndorsement{se1, se2}, []byte{8, 9, 10, 11, 12, 13, 14, 15})
 
-	block1 := makeBlockHeader(withNumber(1), withExtra(data))
+	block1 := makeBlockHeader(withNumber(1), withSeal(data))
 	a := &rrr.BlockActivity{}
 	codec.DecodeBlockActivity(a, ge.ChainID, block1)
 
@@ -127,10 +126,9 @@ func TestAccumulateGenesisActivity(t *testing.T) {
 	// the youngest - as it is considered more recently active than any identity
 	// it enrols in the block it seals.
 	order := make([]int, numIdents)
-	for i := 0; i < numIdents-1; i++ {
-		order[i] = i + 1
+	for i := 0; i < numIdents; i++ {
+		order[numIdents-i-1] = i
 	}
-	order[numIdents-1] = 0
 
 	net.requireOrder(t, a, order)
 }
@@ -186,11 +184,11 @@ func TestAccumulateTwice(t *testing.T) {
 		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
 	require.NoError(err)
 
-	// Now id(0) is the youngest, and id(1) is the oldest
+	net.requireOrder(t, a, []int{11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0})
 
 	// Make 3 blocks. The first and the last will be sealed by the same identity.
 
-	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
+	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers.
 	// Imagining the rounds progress as expected, 2 should seal next
 	ch.Extend(net, 2, 3, 4, 5)
 	// Something very odd happened and 1 seals the next block (in reality this
@@ -198,22 +196,12 @@ func TestAccumulateTwice(t *testing.T) {
 	// endorsers the same too.
 	ch.Extend(net, 1, 2, 3, 4)
 
-	// idYoungest := net.nodeID2id[a.YoungestNodeID()]
-
-	// [ ..., 0]
-	// [ ..., 0, 1]
-	// [ ..., 0, 1, 2]
-	// [ ..., 0, 2, 1]
-
 	err = a.AccumulateActive(
 		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
 	require.NoError(err)
 
-	// idYoungestAfter := net.nodeID2id[a.YoungestNodeID()]
-	// a.logger.Info("youngest before", "id", idYoungest)
-	// a.logger.Info("youngest after", "id", idYoungestAfter)
-	order := []int{3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 2, 1}
-	net.requireOrder(t, a, order)
+	// Note: only the sealer id's should move
+	net.requireOrder(t, a, []int{1, 2, 11, 10, 9, 8, 7, 6, 5, 4, 3, 0})
 }
 
 // TestBranchDetection tests that AccumulateActive spots forks and returns a
@@ -291,7 +279,8 @@ func TestShortActityHorizon(t *testing.T) {
 
 	// We have exactly 5 blocks including the genesis. The genesis has activity
 	// for all 12 identities.
-	order := []int{5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4}
+	// order := []int{5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4}
+	order := []int{4, 3, 2, 1, 11, 10, 9, 8, 7, 6, 5, 0}
 	net.requireOrder(t, a, order)
 
 	// Add 7 more blocks
@@ -313,8 +302,7 @@ func TestShortActityHorizon(t *testing.T) {
 	// are beyond the tActive horizon. When idles are fully implemented,
 	// skipping will involve moving to the idle pool.
 
-	order = []int{5, 6, 7, 1, 2, 3, 4,
-		8, 9, 10, 11, 0}
+	order = []int{0, 11, 10, 9, 8, 4, 3, 2, 1, 7, 6, 5}
 	net.requireOrder(t, a, order)
 }
 
@@ -322,7 +310,7 @@ func (net *network) requireOrder(t *testing.T, a *rrr.ActiveSelection, order []i
 
 	nok := 0
 
-	for cur, icur := rrr.NewActiveSelectionCursor(a).Back(), 0; cur != nil; cur, icur = cur.Prev(), icur+1 {
+	for cur, icur := rrr.NewActiveSelectionCursor(a).Front(), 0; cur != nil; cur, icur = cur.Next(), icur+1 {
 
 		nodeID := cur.NodeID()
 
@@ -333,7 +321,7 @@ func (net *network) requireOrder(t *testing.T, a *rrr.ActiveSelection, order []i
 
 		net.logger.Info(
 			"activeItem", "ok", ok, "addr", nodeID.Address().HexShort(),
-			"order", order[icur], "id", net.nodeID2id[nodeID], "position", a.Len()-icur)
+			"order", order[icur], "id", net.nodeID2id[nodeID], "position", icur)
 	}
 	require.Equal(t, nok, len(order))
 }
@@ -463,7 +451,7 @@ func (net *network) sealBlock(
 	return makeBlockHeader(
 		withNumber(intent.RoundNumber.Int64()),
 		withParent(common.Hash(intent.ParentHash)),
-		withExtra(data))
+		withSeal(data))
 }
 
 func requireMakeSignedExtraData(
@@ -563,12 +551,6 @@ func requireMakeGenesisExtra(
 	return extra
 }
 
-func requireEncodeToBytes(t *testing.T, val interface{}) []byte {
-	b, err := rlp.EncodeToBytes(val)
-	require.NoError(t, err)
-	return b
-}
-
 type headerOption func(h *types.Header)
 
 func withNumber(n int64) headerOption {
@@ -580,8 +562,18 @@ func withExtra(extra []byte) headerOption {
 	return func(h *types.Header) {
 		h.Extra = nil
 		if extra != nil {
-			h.Extra = make([]byte, rrrExtraVanity+len(extra))
-			copy(h.Extra[rrrExtraVanity:], extra)
+			h.Extra = make([]byte, len(extra))
+			copy(h.Extra[:], extra)
+		}
+	}
+}
+
+func withSeal(seal []byte) headerOption {
+	return func(h *types.Header) {
+		h.Extra = nil
+		if seal != nil {
+			h.Extra = make([]byte, rrrExtraVanity+len(seal))
+			copy(h.Extra[rrrExtraVanity:], seal)
 		}
 	}
 }
@@ -606,22 +598,6 @@ func makeBlockHeader(opts ...headerOption) rrr.BlockHeader {
 	}
 
 	return NewBlockHeader(header)
-}
-
-func makeHeader(opts ...headerOption) *types.Header {
-
-	header := &types.Header{
-		Difficulty: big.NewInt(0),
-		Number:     big.NewInt(0),
-		GasLimit:   0,
-		GasUsed:    0,
-		Time:       0,
-	}
-	for _, opt := range opts {
-		opt(header)
-	}
-
-	return header
 }
 
 func requireGenerateKeys(t *testing.T, count int) []*ecdsa.PrivateKey {

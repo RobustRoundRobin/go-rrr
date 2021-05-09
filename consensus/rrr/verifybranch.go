@@ -46,11 +46,11 @@ func (r *EndorsmentProtocol) VerifyBranchHeaders(
 		h0 := Hash{}
 		if r.genesisEx.ChainID == h0 {
 
-			seal := header.GetSeal()
+			extra := header.GetExtra()
 			r.logger.Info(
-				"RRR VerifyBranchHeaders - genesis block", "seal",
-				hex.EncodeToString(seal))
-			err := r.codec.DecodeGenesisExtra(seal, &r.genesisEx)
+				"RRR VerifyBranchHeaders - genesis block", "extra",
+				hex.EncodeToString(extra))
+			err := r.codec.DecodeGenesisExtra(extra, &r.genesisEx)
 			if err != nil {
 				return err
 			}

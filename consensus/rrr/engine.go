@@ -161,6 +161,7 @@ func ConfigureNew(
 	selfMessages, _ := lru.NewARC(lruMessages)
 	e.selfMessages = selfMessages
 
+	e.codec = codec
 	e.r = NewRoundState(codec, privateKey, config, logger)
 }
 

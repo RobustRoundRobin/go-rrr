@@ -263,17 +263,15 @@ func (a *ActiveSelection) AccumulateActive(
 
 		a.logSealerAge(cur, &blockActivity)
 
-		// The sealer is minting and to preserve the "round" ordering, needs to
-		// move to the youngest position - before the identities that may be
-		// enrolled.
-		a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, 0)
-
 		// Do any enrolments. (Re) Enrolling an identity moves it to the
 		// youngest position in the activity set
 		a.enrolIdentities(
 			chainID, youngestKnown,
 			blockActivity.SealerID, blockActivity.SealerPub, blockActivity.Enrol,
 			h, hseal, curNumber)
+
+		// The sealer is the oldest of those identities active for this block and so is added last.
+		a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, 0)
 
 		// The endorsers are active, they do not move in the age ordering.
 		// Note however, for any identity enrolled after genesis, as we are
@@ -288,6 +286,7 @@ func (a *ActiveSelection) AccumulateActive(
 			a.recordActivity(end.EndorserID, h, curNumber)
 		}
 
+		// a.logger.Trace("RRR accumulateActive - parent", "cur", cur.Hash(), "parent", cur.GetParentHash())
 		parentHash := Hash(cur.GetParentHash())
 		if parentHash == zeroHash {
 			a.logger.Debug("RRR accumulateActive - complete, no more blocks")
@@ -837,6 +836,8 @@ type selectionCursor struct {
 type ActivityCursor interface {
 	Back() ActivityCursor
 	Prev() ActivityCursor
+	Front() ActivityCursor
+	Next() ActivityCursor
 	NodeID() Hash
 }
 
@@ -855,6 +856,19 @@ func (cur *selectionCursor) Back() ActivityCursor {
 
 func (cur *selectionCursor) Prev() ActivityCursor {
 	cur.cur = cur.cur.Prev()
+	if cur.cur == nil {
+		return nil
+	}
+	return cur
+}
+
+func (cur *selectionCursor) Front() ActivityCursor {
+	cur.cur = cur.selection.Front()
+	return cur
+}
+
+func (cur *selectionCursor) Next() ActivityCursor {
+	cur.cur = cur.cur.Next()
 	if cur.cur == nil {
 		return nil
 	}

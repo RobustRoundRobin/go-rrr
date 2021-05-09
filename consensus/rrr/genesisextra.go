@@ -13,7 +13,8 @@ import (
 )
 
 var (
-	errInsuficientSeedContribs = errors.New("each genesis identity must contribute to the initial random seed")
+	errInsuficientSeedContribs    = errors.New("each genesis identity must contribute to the initial random seed")
+	ErrGenesisExtraDigestMismatch = errors.New("the included digest of the genesis extra doesn't match the actual")
 )
 
 // Alpha encodes the seed contribution for a single genesis identity.
@@ -178,26 +179,13 @@ func (codec *CipherCodec) ChainID(ci *ChainInit) (Hash, error) {
 	return id, err
 }
 
-type hashedEncoding struct {
-	Encoded []byte
-	Digest  [32]byte
-}
-
 // EncodeHashGenesisExtraData encodes
 func (codec *CipherCodec) EncodeHashGenesisExtraData(gd *GenesisExtraData) ([]byte, error) {
 
 	var err error
 	var b []byte
 
-	he := &hashedEncoding{}
-
-	if he.Encoded, err = codec.EncodeToBytes(gd.ChainInit); err != nil {
-		return nil, err
-	}
-
-	copy(he.Digest[:], codec.c.Keccak256(he.Encoded))
-
-	if b, err = codec.EncodeToBytes(he); err != nil {
+	if b, err = codec.EncodeToBytes(gd.ChainInit); err != nil {
 		return nil, err
 	}
 	return b, nil
@@ -206,17 +194,11 @@ func (codec *CipherCodec) EncodeHashGenesisExtraData(gd *GenesisExtraData) ([]by
 // DecodeGenesisExtra decodes the RRR genesis extra data
 func (codec *CipherCodec) DecodeGenesisExtra(genesisExtra []byte, extra *GenesisExtraData) error {
 
-	he := &hashedEncoding{}
-
-	err := codec.DecodeBytes(genesisExtra, he)
-	if err != nil {
+	if err := codec.DecodeBytes(genesisExtra, &extra.ChainInit); err != nil {
 		return err
 	}
+	copy(extra.ChainID[:], codec.c.Keccak256(genesisExtra))
 
-	if err := codec.DecodeBytes(he.Encoded, &extra.ChainInit); err != nil {
-		return err
-	}
-	copy(extra.ChainID[:], he.Digest[:])
 	return nil
 }
 

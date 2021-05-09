@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	// RRRExtraVanity is the lenght of the space BEFORE rrr's consensus data.
+	// RRRExtraVanity is the length of the space BEFORE rrr's consensus data.
 	// It's the space we leave for normal node vanity.
 	RRRExtraVanity = 32
 )
@@ -94,4 +94,8 @@ func (h *BlockHeader) GetSeal() []byte {
 
 func (h *BlockHeader) GetNonce() [8]byte {
 	return h.Nonce
+}
+
+func (h *BlockHeader) GetExtra() []byte {
+	return h.Extra[:]
 }
