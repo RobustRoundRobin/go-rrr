@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	"golang.org/x/crypto/sha3"
 )
 
 var (
@@ -26,6 +28,51 @@ type VerifyBranchChainReader interface {
 	GetHeaderByNumber(number uint64) BlockHeader
 }
 
+func (r *EndorsmentProtocol) checkGenesisExtra(gex *GenesisExtraData) error {
+
+	// All of the enrolments in the genesis block are signed by the long term
+	// identity key (node key) of the genesis node.
+	ok, genPubBytes, err := r.codec.VerifyRecoverNodeSig(
+		gex.IdentInit[0].ID, gex.IdentInit[0].U[:], gex.IdentInit[0].Q[:])
+	if err != nil || !ok {
+		r.logger.Trace(
+			"id0",
+			"id", gex.IdentInit[0].ID.Hex(), "u", gex.IdentInit[0].U.Hex(),
+			"q", hex.EncodeToString(gex.IdentInit[0].Q[:]))
+		return fmt.Errorf("genesis identity invalid signature: %w", errGensisIdentitiesInvalid)
+	}
+
+	// Check the genesis seed and the signatures of all the contributions to the genesis seed alpha.
+	hasher := sha3.NewLegacyKeccak256()
+	for i, ident := range gex.IdentInit {
+		a := gex.Alpha[i]
+
+		if !r.codec.VerifyNodeSig(ident.ID, a.Contribution[:], a.Sig[:]) {
+			return fmt.Errorf(
+				"genesis identity [%d: %s] alpha sig verify failed: %w",
+				i, ident.ID.Hex(), errGensisIdentitiesInvalid)
+		}
+		hasher.Write(a.Contribution[:])
+	}
+	alpha := hasher.Sum(nil)
+
+	// Now verify the seed was produced correctly by the genesis signer.
+	genPub, err := r.codec.BytesToPublic(genPubBytes)
+	if err != nil {
+		return fmt.Errorf("genesis identity failed to recover public key: %w", err)
+	}
+
+	beta, err := r.vrf.Verify(genPub, alpha, gex.Proof)
+	if err != nil {
+		return fmt.Errorf("genesis seed invalid: %w", err)
+	}
+
+	if !bytes.Equal(beta, gex.Seed) {
+		return fmt.Errorf("genesis seed invalid")
+	}
+	return nil
+}
+
 func (r *EndorsmentProtocol) VerifyBranchHeaders(
 	chain VerifyBranchChainReader, header BlockHeader, parents []BlockHeader) error {
 	// If we want to filter blocks based on the assumption of "loosely
@@ -42,19 +89,25 @@ func (r *EndorsmentProtocol) VerifyBranchHeaders(
 	// that have to sync before they can participate.
 
 	if number == 0 {
+		// Don't cache this result
+		genesisEx := &GenesisExtraData{}
 
-		h0 := Hash{}
-		if r.genesisEx.ChainID == h0 {
-
-			extra := header.GetExtra()
-			r.logger.Info(
-				"RRR VerifyBranchHeaders - genesis block", "extra",
-				hex.EncodeToString(extra))
-			err := r.codec.DecodeGenesisExtra(extra, &r.genesisEx)
-			if err != nil {
-				return err
-			}
+		extra := header.GetExtra()
+		r.logger.Info(
+			"RRR VerifyBranchHeaders - genesis block", "extra",
+			hex.EncodeToString(extra))
+		if err := r.codec.DecodeGenesisExtra(extra, genesisEx); err != nil {
+			r.logger.Debug("RRR VerifyBranchHeaders", "err", err)
+			return err
 		}
+		if err := r.checkGenesisExtra(genesisEx); err != nil {
+			r.logger.Debug("RRR VerifyBranchHeaders", "err", err)
+			return err
+		}
+		r.logger.Debug(
+			"RRR VerifyBranchHeaders - genesis extra",
+			"genid", genesisEx.IdentInit[0].ID.Hex(),
+			"chainid", genesisEx.ChainID.Hex())
 
 		return nil
 	}
