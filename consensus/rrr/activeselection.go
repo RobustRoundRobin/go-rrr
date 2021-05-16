@@ -15,7 +15,7 @@ import (
 
 var (
 	errEnrolmentInvalid           = errors.New("identity enrolment could not be verified")
-	errGensisIdentitiesInvalid    = errors.New("failed to enrol the identities from the genesis block")
+	errGensisIdentitiesInvalid    = errors.New("identities in genesis extra are invalid or badly encoded")
 	errEnrolmentNotSignedBySealer = errors.New("identity enrolment was not indidualy signed by the block sealer")
 	ErrBranchDetected             = errors.New("branch detected")
 	errInsuficientActiveIdents    = errors.New("not enough active identities found")

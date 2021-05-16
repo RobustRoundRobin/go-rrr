@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -49,7 +50,8 @@ var genesisExtraCommand = cli.Command{
 	Flags: []cli.Flag{
 		cli.BoolFlag{Name: "showids", Usage: "Also print the corresponding identities (node addresses)"},
 		cli.StringFlag{Name: "datadir", Usage: "by default look for static-nodes.json in this directory"},
-		cli.StringFlag{Name: "key", Value: "key", Usage: "key file name, relative to datadir"},
+		cli.StringFlag{Name: "keyhex", Usage: "private key as hex string"},
+		cli.StringFlag{Name: "keyfile", Value: "key", Usage: "key file name, relative to datadir"},
 		cli.StringFlag{Name: "alphadir", Usage: "The file names for VRF alpha contribution are interpreted relative to this directory (and datadir if it is not provided)"},
 	},
 }
@@ -69,6 +71,9 @@ func NewCodec() *rrr.CipherCodec {
 }
 
 func genextra(ctx *cli.Context) error {
+
+	var err error
+
 	cipherSuite := secp256k1suite.NewCipherSuite()
 	cipherCodec := NewCodec()
 
@@ -81,9 +86,21 @@ func genextra(ctx *cli.Context) error {
 	if ctx.NArg() == 0 {
 		return fmt.Errorf("provide one or more alpha contribution files in the order you would like the identities enroled")
 	}
-	key, err := crypto.LoadECDSA(resolvePath(dataDir, ctx.String("key")))
-	if err != nil {
-		return err
+
+	var key *ecdsa.PrivateKey
+
+	keyhex := ctx.String("keyhex")
+	if keyhex != "" {
+		if key, err = crypto.HexToECDSA(keyhex); err != nil {
+			return err
+		}
+
+	} else {
+
+		key, err = crypto.LoadECDSA(resolvePath(dataDir, ctx.String("keyfile")))
+		if err != nil {
+			return err
+		}
 	}
 
 	signerNodeID := rrr.NodeIDFromPub(cipherSuite, &key.PublicKey)

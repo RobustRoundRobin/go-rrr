@@ -1,16 +1,13 @@
 package rrr
 
 import (
-	"bytes"
 	"crypto/ecdsa"
 	"encoding/hex"
-	"fmt"
 	"math/big"
 	"math/rand"
 	"sync"
 
 	"github.com/vechain/go-ecvrf"
-	"golang.org/x/crypto/sha3"
 )
 
 // RoundState type for the round state
@@ -166,47 +163,15 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 		r.logger.Info("RRR CheckGenesis", "extraData", hex.EncodeToString(extra))
 		err := r.codec.DecodeGenesisExtra(extra, &r.genesisEx)
 		if err != nil {
+			r.logger.Debug("RRR CheckGenesis", "err", err)
 			return err
 		}
 	}
-
-	// All of the enrolments in the genesis block are signed by the long term
-	// identity key (node key) of the genesis node.
-	ok, genPubBytes, err := r.codec.VerifyRecoverNodeSig(
-		r.genesisEx.IdentInit[0].ID, r.genesisEx.IdentInit[0].U[:], r.genesisEx.IdentInit[0].Q[:])
-	if err != nil || !ok {
-		return fmt.Errorf("genesis identity invalid signature: %w", errGensisIdentitiesInvalid)
+	r.logger.Trace("RRR CheckGenesis", "chainid", r.genesisEx.ChainID.Hex())
+	if err := r.checkGenesisExtra(&r.genesisEx); err != nil {
+		r.logger.Debug("RRR CheckGenesis", "err", err)
+		return err
 	}
-
-	// Check the genesis seed and the signatures of all the contributions to the genesis seed alpha.
-	hasher := sha3.NewLegacyKeccak256()
-	for i, ident := range r.genesisEx.IdentInit {
-		a := r.genesisEx.Alpha[i]
-
-		if !r.codec.VerifyNodeSig(ident.ID, a.Contribution[:], a.Sig[:]) {
-			return fmt.Errorf(
-				"genesis identity [%d: %s] alpha sig verify failed: %w",
-				i, ident.ID.Hex(), errGensisIdentitiesInvalid)
-		}
-		hasher.Write(a.Contribution[:])
-	}
-	alpha := hasher.Sum(nil)
-
-	// Now verify the seed was produced correctly by the genesis signer.
-	genPub, err := r.codec.BytesToPublic(genPubBytes)
-	if err != nil {
-		return fmt.Errorf("genesis identity failed to recover public key: %w", err)
-	}
-
-	beta, err := r.vrf.Verify(genPub, alpha, r.genesisEx.Proof)
-	if err != nil {
-		return fmt.Errorf("genesis seed invalid: %w", err)
-	}
-
-	if !bytes.Equal(beta, r.genesisEx.Seed) {
-		return fmt.Errorf("genesis seed invalid")
-	}
-
 	r.logger.Debug("RRR CheckGenesis", "genid", r.genesisEx.IdentInit[0].ID.Hex())
 
 	return nil
