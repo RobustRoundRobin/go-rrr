@@ -1,18 +1,25 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
+	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/RobustRoundRobin/go-rrr/consensus/rrr"
 	"github.com/RobustRoundRobin/go-rrr/secp256k1suite"
 	"github.com/ethereum/go-ethereum/common"
+	qrrr "github.com/ethereum/go-ethereum/consensus/rrr"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/rpc"
 	"gopkg.in/urfave/cli.v1"
 )
 
@@ -40,6 +47,7 @@ func init() {
 	// Add subcommands.
 	app.Commands = []cli.Command{
 		genesisExtraCommand,
+		inspectHeader,
 	}
 }
 
@@ -56,6 +64,17 @@ var genesisExtraCommand = cli.Command{
 	},
 }
 
+var inspectHeader = cli.Command{
+	Name:   "inspectheaders",
+	Usage:  "Get a block from a live node and inspect the rrr details in the header",
+	Action: inspectheaders,
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "endpoint", Usage: "http(s)://host:port to connect to"},
+		cli.Int64Flag{Name: "start", Usage: "first to GET"},
+		cli.Int64Flag{Name: "end", Usage: "last to GET"},
+	},
+}
+
 type BytesCodec struct{}
 
 func (bc *BytesCodec) EncodeToBytes(val interface{}) ([]byte, error) {
@@ -68,6 +87,76 @@ func (bc *BytesCodec) DecodeBytes(b []byte, val interface{}) error {
 
 func NewCodec() *rrr.CipherCodec {
 	return rrr.NewCodec(secp256k1suite.NewCipherSuite(), &BytesCodec{})
+}
+
+func inspectheaders(ctx *cli.Context) error {
+	codec := NewCodec()
+
+	endpoint := ctx.String("endpoint")
+	eth, err := newEthClient(endpoint)
+	if err != nil {
+		return fmt.Errorf("creating eth client: %w", err)
+	}
+
+	start := ctx.Int64("start")
+	end := ctx.Int64("end")
+	if end < start {
+		return fmt.Errorf("start cant be greater than end")
+	}
+
+	tprev := int64(-1)
+	if start >= 1 {
+
+		block, err := eth.BlockByNumber(context.TODO(), new(big.Int).SetInt64(start-1))
+		if err != nil {
+			return fmt.Errorf("eth_blockByNumber %d: %w", start-1, err)
+		}
+		tprev = int64(block.Header().Time)
+	}
+	for n := start; n <= end; n++ {
+
+		block, err := eth.BlockByNumber(context.TODO(), new(big.Int).SetInt64(n))
+		if err != nil {
+			return fmt.Errorf("eth_blockByNumberd: %w", err)
+		}
+		h := block.Header()
+		header := qrrr.NewBlockHeader(h)
+		a := &rrr.BlockActivity{}
+		if err := codec.DecodeBlockActivity(a, rrr.Hash{}, header); err != nil {
+			return fmt.Errorf("decoding block activity: %w", err)
+		}
+		// print out block number, sealer, endorer1 ... endorsern
+		delta := "NaN"
+		if tprev != -1 {
+			delta = fmt.Sprintf("%d", int64(h.Time)-tprev)
+		}
+		tprev = int64(h.Time)
+
+		s := int64(h.Time)
+		t := time.Unix(s, 0).Format(time.RFC3339)
+		fmt.Printf("%d %s %s %s", header.GetNumber().Int64(), a.SealerID.Hex(), delta, t)
+		for _, e := range a.Confirm {
+			fmt.Printf(" %s", e.EndorserID.Hex())
+		}
+		fmt.Println("")
+
+	}
+
+	return nil
+}
+
+func newEthClient(ethEndpoint string) (*ethclient.Client, error) {
+
+	ethRPC, err := rpc.DialHTTPWithClient(ethEndpoint, &http.Client{Timeout: time.Second * 10})
+	if err != nil {
+		return nil, err
+	}
+	ethClient := ethclient.NewClient(ethRPC)
+	if ethClient == nil {
+		return nil, fmt.Errorf("failed creating ethclient")
+	}
+
+	return ethClient, nil
 }
 
 func genextra(ctx *cli.Context) error {

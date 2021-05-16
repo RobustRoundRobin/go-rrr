@@ -17,6 +17,14 @@
                 "node0/alpha.json", "node1/alpha.json"]
         },
         {
+            "name": "rrrctl inspectblock 1",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/rrrctl",
+            "args": ["inspectheaders", "--endpoint", "http://127.0.0.1:8300", "--start", "3120", "--end", "3125"]
+        },
+        {
             "name": "Launch Package",
             "type": "go",
             "request": "launch",
