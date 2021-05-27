@@ -22,7 +22,8 @@
             "request": "launch",
             "mode": "auto",
             "program": "${workspaceFolder}/cmd/rrrctl",
-            "args": ["inspectheaders", "--endpoint", "http://127.0.0.1:8300", "--start", "3120", "--end", "3125"]
+            "cwd": "${workspaceFolder}/../..",
+            "args": ["inspectheaders", "--dbshare", "--dbname", "rrrblocks.db", "--endpoint", "http://127.0.0.1:8300", "--start", "3126", "--end", "3130"]
         },
         {
             "name": "Launch Package",

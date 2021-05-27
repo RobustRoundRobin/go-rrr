@@ -46,7 +46,28 @@ func PubMarshal(c CipherSuite, pub *ecdsa.PublicKey) []byte {
 
 const (
 	AddressLength = 20
+	HashLen       = 32
 )
+
+func Hex2Hash(s string) Hash {
+	h := Hash{}
+	if s[:2] == "0x" {
+		s = s[2:]
+	}
+	if len(s)%2 == 1 {
+		s = s[:len(s)-1]
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	if len(b) > len(h) {
+		copy(h[:], b[len(b)-HashLen:])
+		return h
+	}
+	copy(h[:], b)
+	return h
+}
 
 // Keccak256Hash hashes a variable number of byte slices and returns a Hash
 func Keccak256Hash(c CipherSuite, b ...[]byte) Hash {

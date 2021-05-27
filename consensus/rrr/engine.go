@@ -12,6 +12,7 @@ import (
 )
 
 var (
+	ErrConfirmPhaseToLarge     = errors.New("confirm phase can not be longer than the round")
 	ErrIncompatibleChainReader = errors.New("chainreader missing required interfaces for RRR")
 	ErrNoGenesisHeader         = errors.New("failed to get genesis header")
 	ErrNotLeaderCandidate      = errors.New("expected to be leader candidate")
@@ -142,27 +143,34 @@ func (e *Engine) IsEnrolmentPending(nodeID [32]byte) bool {
 
 // ConfigureNew a new instance of the rrr consensus engine. Assumes the provided
 // engine instance is new.
-func ConfigureNew(
-	e *Engine, config *Config, codec *CipherCodec,
-	privateKey *ecdsa.PrivateKey, logger Logger) {
+func NewEngine(
+	config *Config, codec *CipherCodec,
+	privateKey *ecdsa.PrivateKey, logger Logger) (*Engine, error) {
 
 	if config.ConfirmPhase > config.RoundLength {
-		logger.Crit("confirm phase can not be longer than the round",
-			"confirmphase", config.ConfirmPhase, "roundlength", config.RoundLength)
+		return nil, fmt.Errorf("confirm=%v, round=%v: %w", config.ConfirmPhase, config.RoundLength, ErrConfirmPhaseToLarge)
 	}
 
-	e.config = config
-	e.privateKey = privateKey
-	e.logger = logger
-
 	// Only get err from NewRC if zize requested is <=0
-	peerMessages, _ := lru.NewARC(lruPeers)
-	e.peerMessages = peerMessages
-	selfMessages, _ := lru.NewARC(lruMessages)
-	e.selfMessages = selfMessages
+	peerMessages, err := lru.NewARC(lruPeers)
+	if err != nil {
+		return nil, err
+	}
+	selfMessages, err := lru.NewARC(lruMessages)
+	if err != nil {
+		return nil, err
+	}
 
-	e.codec = codec
-	e.r = NewRoundState(codec, privateKey, config, logger)
+	e := &Engine{
+		config:       config,
+		codec:        codec,
+		privateKey:   privateKey,
+		logger:       logger,
+		r:            NewRoundState(codec, privateKey, config, logger),
+		peerMessages: peerMessages,
+		selfMessages: selfMessages,
+	}
+	return e, nil
 }
 
 // Start the consensus protocol. To allow for atomic cleanup, the caller

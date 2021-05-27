@@ -3,18 +3,25 @@ package main
 import (
 	"context"
 	"crypto/ecdsa"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/RobustRoundRobin/go-rrr/consensus/rrr"
 	"github.com/RobustRoundRobin/go-rrr/secp256k1suite"
 	"github.com/ethereum/go-ethereum/common"
 	qrrr "github.com/ethereum/go-ethereum/consensus/rrr"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/params"
@@ -72,6 +79,12 @@ var inspectHeader = cli.Command{
 		cli.StringFlag{Name: "endpoint", Usage: "http(s)://host:port to connect to"},
 		cli.Int64Flag{Name: "start", Usage: "first to GET"},
 		cli.Int64Flag{Name: "end", Usage: "last to GET"},
+		cli.IntFlag{Name: "retries", Usage: "limit the number of retries for the getBlockByNumber. Otherwise retry forever with exponential backoff"},
+		cli.BoolFlag{Name: "dbshare", Usage: `the db records are always
+		inserted. by default we do not allow re-use of a db. set this flag to
+		enable reuse. you are responsible for using non over lapping start & end
+		blocks.`},
+		cli.StringFlag{Name: "dbname", Usage: "sqlitedb datasourcename. usualy just the plain filename eg 'blocks.db'"},
 	},
 }
 
@@ -89,13 +102,127 @@ func NewCodec() *rrr.CipherCodec {
 	return rrr.NewCodec(secp256k1suite.NewCipherSuite(), &BytesCodec{})
 }
 
+type BlockDB struct {
+	db          *sql.DB
+	insertBlock *sql.Stmt
+	timeScale   time.Duration
+}
+
+func NewBlockDB(dataSourceName string, share bool) (*BlockDB, error) {
+
+	var err error
+
+	if dataSourceName == "" {
+		return nil, nil
+	}
+
+	// Don't allow re-use of a db from a previous run
+	if !share && dataSourceName != ":memory:" {
+
+		u, err := url.Parse(dataSourceName)
+		if err != nil {
+			return nil, err
+		}
+
+		var filename string
+		switch {
+		case u.Scheme == "":
+			filename = u.Path
+		case u.Scheme == "file":
+			filename = u.Opaque
+		default:
+			filename = u.Path
+		}
+		if u.Scheme == "" {
+			filename = u.Path
+		}
+		if _, err := os.Stat(filename); err == nil {
+			return nil, fmt.Errorf("sqlite3 dsn '%s' exists, updating not supported - move or delete the file please", filename)
+		}
+	}
+
+	bdb := &BlockDB{
+		// We do (block.time * timeScale) to get nanoseconds then record millis.
+		// For quorum, this derives to (block.time * 1) / 1000. Etherum main
+		// chain is timeScale == time.Seconds
+		timeScale: time.Nanosecond,
+	}
+	if bdb.db, err = sql.Open("sqlite3", dataSourceName); err != nil {
+		return nil, err
+	}
+
+	// Create the table if it does not exist
+	s, err := bdb.db.Prepare(`CREATE TABLE IF NOT EXISTS blocks(
+ 	   	blocknumber INTEGER UNIQUE
+ 	   	,timestamp DECIMAL
+ 	   	,size INTEGER
+ 	   	,gasUsed INTEGER
+ 	   	,gasLimit INTEGER
+ 	   	,txcount INTEGER
+		,sealer TEXT
+		,endorsers TEXT
+		,hash TEXT
+		,parentHash TEXT
+		,extra TEXT
+		)`)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = s.Exec()
+	if err != nil {
+		return nil, err
+	}
+
+	// prepare the insert statement
+	bdb.insertBlock, err = bdb.db.Prepare(
+		`INSERT INTO blocks(
+			blocknumber,timestamp,size,
+			gasUsed,gasLimit,txcount,
+			sealer,endorsers,extra)
+			VALUES(?,?,?,?,?,?,?,?,?)`)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return bdb, nil
+}
+
+// Insert a block record into the database. Not transactional
+func (bdb *BlockDB) Insert(
+	block *types.Block, header *types.Header, a *rrr.BlockActivity) error {
+
+	rh := qrrr.NewBlockHeader(header)
+
+	endorsers := make([]string, len(a.Confirm))
+	for i, e := range a.Confirm {
+		endorsers[i] = e.EndorserID.Hex()
+	}
+
+	// Always record the timestamp exactly as we get it to avoid un-intentional 'lossyness'
+	_, err := bdb.insertBlock.Exec(
+		header.Number.Int64(), header.Time, block.Size(),
+		header.GasUsed, header.GasLimit, len(block.Transactions()),
+		a.SealerID.Hex(), strings.Join(endorsers, ", "), hex.EncodeToString(rh.GetExtra()),
+	)
+	return err
+}
+
 func inspectheaders(ctx *cli.Context) error {
+
+	var err error
 	codec := NewCodec()
 
 	endpoint := ctx.String("endpoint")
 	eth, err := newEthClient(endpoint)
 	if err != nil {
 		return fmt.Errorf("creating eth client: %w", err)
+	}
+
+	db, err := NewBlockDB(ctx.String("dbname"), ctx.Bool("dbshare")) // returns nil for dbdsn == ""
+	if err != nil {
+		return err
 	}
 
 	start := ctx.Int64("start")
@@ -113,18 +240,29 @@ func inspectheaders(ctx *cli.Context) error {
 		}
 		tprev = int64(block.Header().Time)
 	}
+
+	var block *types.Block
+
 	for n := start; n <= end; n++ {
 
-		block, err := eth.BlockByNumber(context.TODO(), new(big.Int).SetInt64(n))
+		block, err = getBlockByNumber(ctx, eth, n)
 		if err != nil {
 			return fmt.Errorf("eth_blockByNumberd: %w", err)
 		}
+
 		h := block.Header()
 		header := qrrr.NewBlockHeader(h)
 		a := &rrr.BlockActivity{}
 		if err := codec.DecodeBlockActivity(a, rrr.Hash{}, header); err != nil {
 			return fmt.Errorf("decoding block activity: %w", err)
 		}
+
+		if db != nil {
+			if err := db.Insert(block, h, a); err != nil {
+				println(fmt.Errorf("inserting block %v: %w", h.Number, err).Error())
+			}
+		}
+
 		// print out block number, sealer, endorer1 ... endorsern
 		delta := "NaN"
 		if tprev != -1 {
@@ -143,6 +281,47 @@ func inspectheaders(ctx *cli.Context) error {
 	}
 
 	return nil
+}
+
+func getBlockByNumber(opts *cli.Context, eth *ethclient.Client, blockNumber int64) (*types.Block, error) {
+
+	retries := opts.Int("retries")
+
+	bigN := new(big.Int).SetInt64(blockNumber)
+
+	var err error // will return the last error or nil
+	var block *types.Block
+
+	for i := 0; retries == 0 || i < retries; i++ {
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		block, err = eth.BlockByNumber(ctx, bigN)
+		if err == nil {
+			cancel()
+			return block, nil
+		}
+		cancel()
+		time.Sleep(backoffDuration(i))
+	}
+	return block, err
+}
+
+// derived from https://blog.gopheracademy.com/advent-2014/backoff/
+var backoffms = []int{0, 0, 10, 10, 100, 100, 500, 500, 3000, 3000, 5000, 5000, 8000, 8000, 10000, 10000}
+
+func backoffDuration(nth int) time.Duration {
+	if nth >= len(backoffms) {
+		nth = len(backoffms) - 1
+	}
+	return time.Duration(jitter(backoffms[nth])) * time.Millisecond
+}
+
+func jitter(ms int) int {
+	if ms == 0 {
+		return 0
+	}
+	return ms/2 + rand.Intn(ms)
 }
 
 func newEthClient(ethEndpoint string) (*ethclient.Client, error) {

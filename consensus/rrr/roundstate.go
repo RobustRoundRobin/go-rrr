@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/vechain/go-ecvrf"
 )
@@ -190,7 +191,40 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 	}
 
 	r.a = NewActiveSelection(r.codec, r.nodeID, r.logger)
-	r.a.Reset(r.config.Activity, chain.CurrentHeader())
+
+	header := chain.CurrentHeader()
+	r.a.Reset(r.config.Activity, header)
+
+	// Implicit dependnecy on ntp for 'block is the clock' model. assume that
+	// the timestamp on the last block was acceptable to the network. The
+	// ethereum yellow paper, for PoW, adjusts difficulty to maintain
+	// homeostasis in the block time interval. This in turn requires that
+	// ethereum nodes have some loosely synchronised view of time. geth uses ntp
+	// to achieve this. etherum SO is full of people not being able to sync
+	// because their node host clocks are out of whack. All of this means 2
+	// things:
+	//   1. Actually, the requirement for loosely synchronised time in rrr
+	//      is no big deal, and we can infact *count* on it in geth.
+	//   2. For the 'block is the clock model' we can safely reduce the
+	//      dependency on ntp in general to just "loosely syncrhonised network" at
+	//      the time of the last block - and our local clock being (currently) good
+	//      relative to the last block time.
+	//
+	// So set the failedCount based in the interval between the last block being
+	// sealed and 'now'
+
+	// Note: we assume quorum/geth for now, and that means this timestamp is nanoseconds
+	blocktime := (time.Duration(header.GetTime()) * time.Nanosecond)
+
+	// RoundLength is in milliseconds. Calculate how many rounds *this* node has
+	// missed since the block was minted. And set FailedAttempts to match. If
+	// only this block has been down or off line, the effects of this will reset
+	// as soon as we see the next block. If the whole network is down - common
+	// for development and some private network scenarios, it will start
+	// everyone off on the same notion of what round it is. This is consistent
+	// with what the paper essentially does for every round. In the paper round
+	// number is always t-now / round time.
+	r.FailedAttempts = uint(blocktime / time.Duration(r.config.RoundLength) * time.Millisecond)
 
 	return nil
 }
