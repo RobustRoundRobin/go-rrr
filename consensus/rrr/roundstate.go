@@ -91,15 +91,12 @@ type EndorsmentProtocol struct {
 	vrf ecvrf.VRF
 	T   RoundTime
 
-	samplesTaken int
-	Rand         *rand.Rand
-	roundStart   time.Time
+	Rand *rand.Rand
 	// Updated in the NewChainHead method
 	chainHead            BlockHeader
 	chainHeadExtraHeader *ExtraHeader     // genesis & consensus blocks
 	chainHeadExtra       *SignedExtraData // consensus blocks only
 	chainHeadRound       *big.Int
-	seedRound            *big.Int
 	chainHeadSealTime    time.Time
 
 	Phase RoundPhase
@@ -140,9 +137,9 @@ type EndorsmentProtocol struct {
 // NewRoundState creates and initialises a RoundState
 func NewRoundState(
 	codec *CipherCodec, key *ecdsa.PrivateKey, config *Config, logger Logger,
-) *EndorsmentProtocol {
+) EndorsmentProtocol {
 
-	s := &EndorsmentProtocol{
+	r := EndorsmentProtocol{
 		logger:     logger,
 		privateKey: key,
 		codec:      codec,
@@ -151,7 +148,7 @@ func NewRoundState(
 		nodeAddr: PubToAddress(codec.c, &key.PublicKey),
 		config:   config,
 		vrf:      ecvrf.NewSecp256k1Sha256Tai(),
-		T:        NewRoundTime(config, logger),
+		T:        NewRoundTime(config),
 
 		pendingEnrolments: make(map[Hash]*EnrolmentBinding),
 
@@ -163,10 +160,11 @@ func NewRoundState(
 	if logger != nil {
 		logger.Trace(
 			"RRR NewRoundState - timer durations",
-			"round", roundDuration, "i", t.Intent, "c", t.Confirm, "b", t.Broadcast)
+			"round", r.T.Intent+r.T.Confirm+r.T.Broadcast,
+			"i", r.T.Intent, "c", r.T.Confirm, "b", r.T.Broadcast)
 	}
 
-	return s
+	return r
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty

@@ -110,7 +110,7 @@ type Engine struct {
 	// Handles all of the  eng* types and core.ChainHeadEvent
 	runningCh chan interface{}
 
-	r *EndorsmentProtocol
+	r EndorsmentProtocol
 }
 
 func (e *Engine) RunLock() {

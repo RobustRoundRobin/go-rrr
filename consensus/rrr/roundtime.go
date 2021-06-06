@@ -34,20 +34,25 @@ func NewRoundTime(
 		Confirm:   c / 2,
 		Intent:    c - (c / 2),
 		Broadcast: roundDuration - c,
-		logger:    logger,
 	}
 
 	for _, o := range opts {
-		o(t)
+		o(&t)
 	}
 
 	return t
 }
 
-// Start creates and starts the ticker. time.Timer's are a bit tricky. Be very
+// StartIntent creates and starts the ticker. time.Timer's are a bit tricky. Be very
 // careful to StopTicker correctly if you want call this more than once.
-func (t *RoundTime) Start() {
+func (t *RoundTime) StartIntent() {
 	t.Ticker = time.NewTimer(t.Intent)
+}
+func (t *RoundTime) StartConfirm() {
+	t.Ticker = time.NewTimer(t.Confirm)
+}
+func (t *RoundTime) StartBroadcast() {
+	t.Ticker = time.NewTimer(t.Broadcast)
 }
 
 // Stop stops and, if necessary, drains the ticker

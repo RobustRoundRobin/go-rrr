@@ -27,17 +27,8 @@ func (r *EndorsmentProtocol) State() RoundState {
 
 // StartRounds initialises the current round, establishes the current seed and
 // starts the phase ticker. The engine run go routine calls this exactly once
-// when it starts up. If the current block is the genesis block and its header
-// can't be decoded, we panic.
+// when it starts up.
 func (r *EndorsmentProtocol) StartRounds(b Broadcaster, chain EngineChainReader) {
-
-	r.roundStart = time.Now()
-	r.T.Start()
-
-	// We use the intent/confirm phases for the rand initialisation as well as
-	// for normal operation.
-	r.Phase = RoundPhaseIntent
-	r.SetState(RoundStateInactive)
 
 	var err error
 	// On error stay up and wait for a block, regardless of round agreement
@@ -47,114 +38,129 @@ func (r *EndorsmentProtocol) StartRounds(b Broadcaster, chain EngineChainReader)
 	head := chain.CurrentHeader()
 	err = r.setChainHead(chain, head)
 	if err != nil {
-		r.logger.Warn("RRR StartRounds - setChainHead", "err", err)
-		r.SetState(RoundStateNeedBlock)
+		r.logger.Crit("RRR StartRounds - setChainHead", "err", err)
 		return
 	}
+
+	// AccumulateActive from the current head lR
 
 	// Note: we must do this before calling SelectCandidatesAndEndorsers or
 	// AdvanceRandomState, and we *may* call that to catch up the DRGB with
 	// failed attempts here
 	if err := r.a.AccumulateActive(
 		r.genesisEx.ChainID, r.config.Activity, chain, r.chainHead); err != nil {
-		r.logger.Warn("RRR StartRounds - AccumulateActive", "err", err)
-		r.SetState(RoundStateNeedBlock)
+		r.logger.Crit("RRR StartRounds - AccumulateActive", "err", err)
 	}
 
-	switch r.config.RoundAgreement {
+	roundSeed, seedRound, err := r.StableSeed(chain, r.chainHeadRound.Uint64())
+	if err != nil {
+		r.logger.Crit("RRR StartRounds", "err", err)
+		return
+	}
+	r.Rand = randFromSeed(roundSeed)
 
-	case RoundAgreementNTP:
+	// failedAttempts since the last known round (or genesis seal) is given as:
+	//
+	// f = [ now - T(lR) ] / rl
+	//
+	// To aligh the DRGB, we need to evaluate this many permutations
+	rl := r.T.Intent + r.T.Confirm + r.T.Broadcast
 
-		// Set the round number to the block we would have taken the seed from
-		// for the current round, so that we advance the random state acordingly
+	now := time.Now()
 
-		r.Number.Set(r.seedRound)
-		r.samplesTaken = 0
-		r.FailedAttempts = 0 // We reset Number so haven't accounted for any failed attempts since the new Number
-		roundNumberNow := RoundsSince(r.genesisSealTime, r.config.RoundLength)
-		if roundNumberNow > 0 {
-			r.advanceRoundNumber(roundNumberNow - 1)
-		}
+	lR := r.chainHeadRound
 
-	case RoundAgreementBlockClock:
+	f := int32(now.Sub(r.chainHeadSealTime) / rl)
+
+	// T(eR) Get the expected start time for the expected round eR
+	teR := r.chainHeadSealTime.Add(lR+f) * rl
+
+	// ro = now - T(eR) = offset into expected round
+	ro := now.Sub(teR)
+
+	// Pick the phase for ro
+	switch {
+	case 0 <= ro < r.T.Intent:
+		r.Phase = RoundPhaseIntent
+		r.T.StartIntent()
+		r.logger.Info("RRR StartRounds - Phase = Intent", "f", f, "ro", ro)
+	case r.T.Intent <= ro < r.T.Intent+r.T.Confirm:
+		r.Phase = RoundPhaseConfirm
+		r.T.StartConfirm()
+		r.logger.Info("RRR StartRounds - Phase = Confirm", "f", f, "ro", ro)
+	case r.T.Intent+r.T.Confirm <= ro <= r.T.Intent+r.T.Confirm+r.T.Broadcast:
 		fallthrough
 	default:
-		r.Number.Add(head.GetNumber(), bigOne)
+		r.Phase = RoundPhaseBroadcast
+		r.T.StartBroadcast()
+		r.logger.Info("RRR StartRounds - Phase = Broadcast", "f", f, "ro", ro)
+	}
 
+	for i := 0; i < f; i++ {
+		r.nextActivePermutation()
+	}
+
+	r.SetState(RoundStateInactive)
+
+	if r.config.RoundAgreement == RoundAgreementBlockClock {
+		r.Number.Add(head.GetNumber(), bigOne)
 	}
 }
 
 func (r *EndorsmentProtocol) nextActivePermutation() []int {
 
-	nActive := r.a.Len()
-	if uint64(nActive) < r.config.Candidates+r.config.Quorum {
-		r.logger.Info("RRR nextActivePermutation", "msg",
-			fmt.Sprintf("%v < (c)%v + (q)%v, len(idle)=%v: %v",
-				nActive, r.config.Candidates, r.config.Quorum, r.a.LenIdle(),
-				errInsuficientActiveIdents))
+	// DIVERGENCE (5) we do sample *without* replacement because replacement
+	// predjudices the quorum in small networks (and network initialisation)
 
-		return nil
-	}
+	nsamples := int(r.config.Candidates + r.config.Endorsers)
+	nactive := r.a.Len()
 
-	// Get a random permutation of indices into the active list. This is random
-	// selection of endorsers *without* replacement (the paper suggests with).
-	// Note that the state of the DRGB is advanced nActive - nCandidate times.
-
-	r.samplesTaken += (int(nActive) - int(r.config.Candidates))
-	// Note: this samples the state na - nc times
-	return r.Rand.Perm(nActive - int(r.config.Candidates))
-}
-
-// advanceRoundNumber sets the current round number and accounts for the effect
-// of any skipped rounds on the state of the random source.  (as though a full
-// SelectCandidatesAndEndorsers was run for each of the skiped rounds). We
-// don't need to do this for the blockclock model, just the ntp time based
-// rounds.
-func (r *EndorsmentProtocol) advanceRoundNumber(roundNumberNow uint64) {
-
-	if roundNumberNow == r.Number.Uint64() {
-		r.logger.Warn("round (now) == round (cur)", "rnow", roundNumberNow)
-	}
-
-	nActive := r.a.Len()
-
-	if uint64(nActive) < r.config.Candidates+r.config.Quorum {
-		r.logger.Info("RRR advanceRoundNumber", "msg",
-			fmt.Sprintf("%v < (c)%v + (q)%v, len(idle)=%v: %v",
-				nActive, r.config.Candidates, r.config.Quorum, r.a.LenIdle(),
-				errInsuficientActiveIdents))
-
-		return
-	}
-
-	// Work out the absolute number of failed rounds since we got the last block
-	failedAttempts := uint32(0)
-
-	// Advance the random state to account for time being ahead of block
-	// production (and/or disemination)
-
-	currentNumber := r.Number.Uint64()
-	if currentNumber+1 < roundNumberNow {
-		// if roundNumberNow+1 < currentNumber { // + 1 skips the case where we would set failedAttempts to 0
-
-		// Don't attempt to accomodate a change that over flows 4B
-		failedAttempts = uint32(roundNumberNow - currentNumber - 1)
-
-		// Don't re sample for failed attempts we have already accounted for.
-		if failedAttempts > r.FailedAttempts {
-			r.logger.Info(
-				"RRR Re-sampling DRGB", "fa", failedAttempts, "a", failedAttempts-r.FailedAttempts)
-
-			for i := uint32(0); i < failedAttempts-r.FailedAttempts; i++ {
-				// samples the state na - nc times
-				r.Rand.Perm(int(nActive) - int(r.config.Candidates))
-				r.samplesTaken += (int(nActive) - int(r.config.Candidates))
-			}
+	// This will force select them all active identities when na < ns. na=0
+	// is not special.
+	if nactive <= nsamples {
+		s := make([]int, nsamples)
+		for i := 0; i < nsamples; i++ {
+			s[i] = i
 		}
+		return s
 	}
-	r.FailedAttempts = failedAttempts
 
-	r.Number.SetUint64(roundNumberNow)
+	// For efficiency, when na is close to ns, we randomly eliminate indices
+	// until we only have nsamples left.
+	if nactive < nsamples*2 {
+
+		s := make([]int, nactive)
+
+		for i := 0; i < len(s); i++ {
+			s[i] = i
+		}
+
+		for len(s) > nsamples {
+			rv := r.Rand.Intn(len(s))
+
+			// move selected to end then remove then shorten the slice by 1
+			s[rv], s[len(s)-1] = s[len(s)-1], s[rv]
+			s = s[:len(s)-1]
+		}
+
+		return s
+	}
+
+	indices := map[int]bool{}
+	s := make([]int, nsamples)
+	for i := 0; i < nsamples; i++ {
+		var rv int
+		for {
+			rv = r.Rand.Intn(nactive)
+			if indices[rv] {
+				continue
+			}
+			break
+		}
+		indices[rv] = true
+		s[i] = rv
+	}
+	return s
 }
 
 // NewChainHead is called to handle the chainHead event from the block chain.
@@ -168,55 +174,7 @@ func (r *EndorsmentProtocol) NewChainHead(
 	if err != nil {
 		// This likely means the genesis block is funted (or Start is broken)
 		r.logger.Info("RRR NewChainHead - setChainHead", "err", err)
-		r.SetState(RoundStateNeedBlock)
 		return
-	}
-
-	switch r.config.RoundAgreement {
-	case RoundAgreementNTP:
-
-		// New seed, so set the round number to match the seed block then
-		// advance the DRGB state as appropriate for the intervening
-		// failedAttempts.
-		r.Number.Set(r.seedRound)
-		r.samplesTaken = 0
-		r.FailedAttempts = 0 // We reset Number so haven't accounted for any failed attempts since the new Number
-		roundNumberNow := RoundsSince(r.genesisSealTime, r.config.RoundLength)
-		r.advanceRoundNumber(roundNumberNow)
-
-		return
-
-	case RoundAgreementBlockClock:
-		fallthrough
-	default:
-
-		if err := r.accumulateActive(chain, head); err != nil {
-			r.SetState(RoundStateNeedBlock)
-			return
-		}
-
-		// Number = head.number + 1
-		r.Number.Add(head.GetNumber(), bigOne)
-
-		// Reset the timer when a new block arrives. This should offer lose
-		// synchronisation.  RRR's notion of active and age requires that honest
-		// nodes give endorsers a consistent amount of time per round to record
-		// their endorsement by signing an intent for the leader. Whether or not
-		// the endorsement was required to reach the quorum, the presence of the
-		// endorsement in the block header is how RRR determines if non leader
-		// nodes are active in a particular round. Note that go timers are quite
-		// tricky, see
-		// https://blogtitle.github.io/go-advanced-concurrency-patterns-part-2-timers/
-
-		r.T.Stop() // MUST do this here, else reseting the ticker will deadlock
-		r.Phase = r.T.PhaseAdjust(r.chainHeadSealTime)
-		r.FailedAttempts = 0
-
-		r.logger.Info(
-			fmt.Sprintf("RRR new round *** %s ***", r.state.String()),
-			"round", r.Number, "phase", r.Phase.String(), "addr", r.nodeAddr.Hex())
-
-		r.electAndPropose(b)
 	}
 }
 
@@ -244,26 +202,16 @@ func (r *EndorsmentProtocol) setChainHead(chain EngineChainReader, head BlockHea
 		r.chainHeadExtraHeader = &r.chainHeadExtra.ExtraHeader
 	}
 
-	roundSeed, seedRound, err := r.StableSeed(chain, blockNumber)
-	if err != nil {
-		return err
-	}
-	r.seedRound.SetUint64(seedRound)
-
-	r.Rand = randFromSeed(roundSeed)
-
-	// Establish the round of the chain head. The genesis block is round 0. Note
-	// that the current round r.Number will be >= chainHeadRound + 1 in a
-	// healthy network.
-	r.chainHeadRound.SetUint64(0)
-	if blockNumber > 0 {
-		// For blockclock the intent roundnumber is the block number (checked by VerifyHeader)
-		r.chainHeadRound.Set(r.chainHeadExtra.Intent.RoundNumber)
-	}
 	return nil
 }
 
-func (r *EndorsmentProtocol) PhaseTick2(b Broadcaster, chain EngineChainReader) {
+// PhaseTick deals with the time based round state transitions. It MUST be
+// called each time a tick is read from the ticker. At the end of the intent
+// phase, if an endorser, the oldest seen intent is endorsed. At the end of the
+// confirmation phase, if a leader candidate AND the current intent has
+// sufficient endorsements, the block for the intent is sealed. Geth will then
+// broadcast it.
+func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 
 	switch r.Phase {
 	case RoundPhaseIntent:
@@ -278,7 +226,8 @@ func (r *EndorsmentProtocol) PhaseTick2(b Broadcaster, chain EngineChainReader) 
 		}
 
 		r.logger.Trace(
-			"RRR PhaseTick - RoundPhaseIntent -> RoundPhaseConfirm", "r", r.Number, "f", r.FailedAttempts)
+			"RRR PhaseTick - RoundPhaseIntent -> RoundPhaseConfirm",
+			"r", r.Number, "f", r.FailedAttempts)
 
 		r.T.ResetForConfirmPhase()
 		r.Phase = RoundPhaseConfirm
@@ -288,7 +237,7 @@ func (r *EndorsmentProtocol) PhaseTick2(b Broadcaster, chain EngineChainReader) 
 
 		case RoundStateLeaderCandidate:
 
-			if confirmed, err = r.sealCurrentBlock(chain); confirmed {
+			if confirmed, err := r.sealCurrentBlock(chain); confirmed {
 
 				r.logger.Info(
 					"RRR PhaseTick - sealed block", "addr", r.nodeAddr.Hex(),
@@ -310,32 +259,76 @@ func (r *EndorsmentProtocol) PhaseTick2(b Broadcaster, chain EngineChainReader) 
 		// Was the round successful ? do we have the block from the completed
 		// round now ?
 
-		switch r.config.RoundAgreement {
-		case RoundAgreementNTP:
-			// At this point, even for the first round R1 after genesis, we can
-			// require r.chainHeadExtra != nil for a succesful round. But we still
-			// need to account for failed attempts and those are likely when
-			// initialising a new chain.
-			if r.chainHeadExtra == nil || r.chainHeadExtra.Intent.RoundNumber.Cmp(r.Round) != 0 {
+		// XXX: TODO: what if chainHeadExtra.Intent.RoundNumber in the future
+		// or the past at this point ? It is the agreed round according to
+		// consensus so presumably we should accept it. If it doesn't agree
+		// with our time based notion of round, we should probably (at least)
+		// warn, possibly run the ntp sync check, and possibly just enter
+		// NeedBlock state
 
-				var chainHeadRound *big.Int
-				if r.chainHeadExtra != nil {
-					chainHeadRound = r.chainHeadExtra.Intent.RoundNumber
-				}
+		failedAttempts := uint32(0)
 
-				r.logger.Info(
-					"RRR PhaseTick - round failed to produce block",
-					"chr", chainHeadRound, "r", r.Number, "r - 1 - f", r.Number.Int64()-1-r.FailedAttempt)
+		// At this point, even for the first round R1 after genesis, we can
+		// require r.chainHeadExtra != nil for a succesful round. But we still
+		// need to account for failed attempts and those are likely when
+		// initialising a new chain.
+		if r.chainHeadExtra == nil || r.chainHeadExtra.Intent.RoundNumber.Cmp(r.Number) != 0 {
 
-				r.FailedAttempts += 1
+			var chainHeadRound *big.Int
+			if r.chainHeadExtra != nil {
+				chainHeadRound = r.chainHeadExtra.Intent.RoundNumber
 			}
 
-			r.Number.Add(big1)
+			r.logger.Info(
+				"RRR PhaseTick - round failed to produce block",
+				"chr", chainHeadRound, "r", r.Number, "r - 1 - f",
+				r.Number.Int64()-1-int64(r.FailedAttempts))
 
-		case RoundAgreementBlockClock:
-			fallthrough
-		default:
-			r.FailedAttempts++
+			failedAttempts = r.FailedAttempts + 1
+
+		}
+
+		r.FailedAttempts = failedAttempts
+		if r.config.RoundAgreement == RoundAgreementNTP {
+			r.Number.Add(r.Number, bigOne)
+		}
+
+		// If we have 0 failed attempts, then the chainHead is the  new block
+		// R-1 for the new round R. Otherwise, we keep the active selection we
+		// have. XXX: TODO what do we do with an invalid chain head event ?
+		if r.FailedAttempts == 0 {
+
+			if r.config.RoundAgreement == RoundAgreementBlockClock {
+				r.Number.Add(r.chainHead.GetNumber(), bigOne)
+			}
+
+			roundSeed, seedRound, err := r.StableSeed(chain, r.chainHead.GetNumber().Uint64())
+			if err != nil {
+				r.SetState(RoundStateNeedBlock)
+				r.logger.Info("RRR PhaseTick -> RoundStateNeedBlock", "err", err)
+				return
+			}
+
+			r.Rand = randFromSeed(roundSeed)
+
+			// Establish the round of the chain head. The genesis block is round 0.
+			r.chainHeadRound.SetUint64(0)
+
+			if r.chainHeadExtra != nil { //  nil for genesis round R1
+				// For blockclock the intent roundnumber is the block number
+				// (checked by VerifyHeader)
+				r.chainHeadRound.Set(r.chainHeadExtra.Intent.RoundNumber)
+			}
+			// Note: this sets chainHeadRound == R-1 with respect to current
+			// r.Number at this point
+
+			// Update the active selection from the new head
+
+			if err := r.accumulateActive(chain, r.chainHead); err != nil {
+				r.SetState(RoundStateNeedBlock)
+				r.logger.Info("RRR PhaseTick -> RoundStateNeedBlock (2)", "err", err)
+				return
+			}
 		}
 
 		r.Phase = RoundPhaseIntent
@@ -345,99 +338,6 @@ func (r *EndorsmentProtocol) PhaseTick2(b Broadcaster, chain EngineChainReader) 
 		panic("TODO - recovery")
 	}
 
-}
-
-// PhaseTick deals with the time based round state transitions. It MUST be
-// called each time a tick is read from the ticker. At the end of the intent
-// phase, if an endorser, the oldest seen intent is endorsed. At the end of the
-// confirmation phase, if a leader candidate AND the current intent has
-// sufficient endorsements, the block for the intent is sealed. Geth will then
-// broadcast it. Finally, we deal with liveness here. The FailedAttempt counter
-// is (almost) always incremented and the endorsers resampled. The exceptions
-// are when we are starting and are in RoundStateNodeStarting (normal), and if we
-// enter RoundStateNeedsBlock. NeedsBlock means the node will not progress unless
-// it sees a new block from the network.
-func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
-
-	var confirmed bool
-	var err error
-
-	if r.Phase == RoundPhaseIntent {
-
-		// Completed intent phase, the intent we have here, if any, is the
-		// oldest we have seen. This gives us liveness in the face of network
-		// issues and misbehaviour. The > Nc the stronger the mitigation.
-		// Notice that we DO NOT check if we are currently selected as an
-		// endorser.
-
-		if r.state == RoundStateNeedBlock {
-			// If we don't have a valid head, we have no buisiness
-			// handing out endorsements
-			if r.signedIntent != nil {
-				r.logger.Trace(
-					"RRR PhaseTick - intent -discarding received intent due to round state",
-					"r", r.Number, "f", r.FailedAttempts, "state", r.state.String())
-				r.signedIntent = nil
-			}
-		}
-
-		if r.signedIntent != nil {
-
-			oldestSeen := r.signedIntent.NodeID.Address()
-			r.logger.Trace(
-				"RRR PhaseTick - intent - sending endorsement to oldest seen",
-				"r", r.Number, "f", r.FailedAttempts)
-			b.SendSignedEndorsement(oldestSeen, r.signedIntent)
-			r.signedIntent = nil
-		}
-
-		r.logger.Trace(
-			"RRR PhaseTick - RoundPhaseIntent -> RoundPhaseConfirm", "r", r.Number, "f", r.FailedAttempts)
-
-		r.T.ResetForConfirmPhase()
-		r.Phase = RoundPhaseConfirm
-		return
-	}
-
-	// completed confirm phase
-
-	// Deal with the 'old' state and any end conditions
-	switch r.state {
-
-	case RoundStateNeedBlock:
-		// The current head block we have is no good to us, or we have
-		// an implementation bug.
-		r.logger.Warn("RRR PhaseTick", "state", r.state.String())
-		r.T.ResetForIntentPhase()
-		r.Phase = RoundPhaseIntent
-		return
-
-	case RoundStateLeaderCandidate:
-
-		if confirmed, err = r.sealCurrentBlock(chain); confirmed {
-
-			r.logger.Info(
-				"RRR PhaseTick - sealed block", "addr", r.nodeAddr.Hex(),
-				"r", r.Number, "f", r.FailedAttempts)
-
-		} else if err != nil {
-
-			r.logger.Warn("RRR PhaseTick - sealCurrentBlock", "err", err)
-		}
-
-	case RoundStateInactive:
-		r.logger.Debug("RRR PhaseTick", "state", r.state.String())
-	}
-
-	switch r.config.RoundAgreement {
-	case RoundAgreementNTP:
-		// The round is always based on 'now'
-		r.ntpNextRound(b, chain)
-	case RoundAgreementBlockClock:
-		fallthrough
-	default:
-		r.blockclockNextRoundAttempt(b, chain)
-	}
 }
 
 func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head BlockHeader) error {
@@ -529,43 +429,6 @@ func RoundsSince(when time.Time, roundLength uint64) uint64 {
 func RoundsInRange(start time.Time, end time.Time, roundLength uint64) uint64 {
 	roundDuration := time.Duration(roundLength) * time.Second
 	return uint64(end.Sub(start) / roundDuration)
-}
-
-func (r *EndorsmentProtocol) ntpNextRound(b Broadcaster, chain EngineChainReader) {
-
-	roundDuration := time.Duration(r.config.RoundLength) * time.Second
-	since := time.Since(r.genesisSealTime)
-	roundNumberNow := uint64(since / roundDuration)
-
-	// Note: RoundLength is seconds, so our ideal start should always be a
-	// whole second.
-	idealStart := r.genesisSealTime.Add(time.Duration(roundNumberNow) * roundDuration)
-
-	if roundNumberNow == r.Number.Uint64() {
-		pause := roundDuration - time.Since(idealStart)
-		r.logger.Info("ROUND TO FAST - waiting", "w", pause)
-		time.Sleep(pause)
-		roundNumberNow += 1
-		idealStart = r.genesisSealTime.Add(time.Duration(roundNumberNow) * roundDuration)
-	}
-
-	// roundNumberNow := RoundsSince(r.genesisSealTime, r.config.RoundLength)
-	r.advanceRoundNumber(roundNumberNow)
-
-	r.Phase = r.T.PhaseAdjust(idealStart)
-	r.electAndPropose(b)
-}
-
-func (r *EndorsmentProtocol) blockclockNextRoundAttempt(b Broadcaster, chain EngineChainReader) {
-	r.Phase = RoundPhaseIntent
-	r.T.ResetForIntentPhase()
-	// We always increment failedAttempts if we reach here. This is the local
-	// nodes perspective on how many times the network has failed to produce a
-	// block. failedAttempts is reset in newHead. Until we *see* a newHead, we
-	// consider the attempt failed even if we seal a block above
-	r.FailedAttempts++
-
-	r.electAndPropose(b)
 }
 
 // electAndPropose selects the candidates and endorsers and determines the nodes
