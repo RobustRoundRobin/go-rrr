@@ -34,6 +34,7 @@ type EngSealTask struct {
 type pendingIntent struct {
 	Candidate    bool
 	SI           *SignedIntent
+	Alpha        []byte // the seed on the block that will be parent if the intent block is produced
 	SealHash     Hash
 	RMsg         RMsg
 	Msg          []byte
@@ -70,14 +71,15 @@ func (r *EndorsmentProtocol) NewSealTask(b Broadcaster, et *EngSealTask) {
 }
 
 func (r *EndorsmentProtocol) newSealTask(
-	state RoundState, et *EngSealTask, roundNumber *big.Int, failedAttempts uint,
+	state RoundState, et *EngSealTask, roundNumber *big.Int, failedAttempts uint32,
 ) error {
 	var err error
 	r.intentMu.Lock()
 	defer r.intentMu.Unlock()
 
 	var newIntent *pendingIntent
-	if newIntent, err = r.newPendingIntent(et, roundNumber, failedAttempts); err != nil {
+	if newIntent, err = r.newPendingIntent(
+		et, r.chainHeadExtraHeader.Seed, roundNumber, failedAttempts); err != nil {
 		return err
 	}
 
@@ -91,7 +93,7 @@ func (r *EndorsmentProtocol) newSealTask(
 // issued an intent for this round and we are still in the intent phase, we just
 // issue another. Endorsing peers will endorse the *most recent* intent from the
 // *oldest* identity they have selected as leader.
-func (r *EndorsmentProtocol) refreshSealTask(roundNumber *big.Int, failedAttempts uint) error {
+func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber *big.Int, failedAttempts uint32) error {
 
 	var err error
 	r.intentMu.Lock()
@@ -109,7 +111,7 @@ func (r *EndorsmentProtocol) refreshSealTask(roundNumber *big.Int, failedAttempt
 
 	// The roundNumber or failedAttempts has to change in order for the message
 	// to be broadcast.
-	newIntent, err := r.newPendingIntent(r.sealTask, roundNumber, failedAttempts)
+	newIntent, err := r.newPendingIntent(r.sealTask, parentSeed, roundNumber, failedAttempts)
 	if err != nil {
 		return fmt.Errorf("refreshSealTask - newPendingIntent: %v", err)
 	}
@@ -122,15 +124,21 @@ func (r *EndorsmentProtocol) refreshSealTask(roundNumber *big.Int, failedAttempt
 }
 
 func (r *EndorsmentProtocol) newPendingIntent(
-	et *EngSealTask, roundNumber *big.Int, failedAttempts uint) (*pendingIntent, error) {
+	et *EngSealTask, parentSeed []byte, roundNumber *big.Int,
+	failedAttempts uint32) (*pendingIntent, error) {
 
 	var err error
 
 	r.logger.Trace("RRR newPendingIntent", "r", roundNumber, "f", failedAttempts)
+	if len(parentSeed) != 32 {
+		return nil, fmt.Errorf("parent seed wrong length want 32 not %d", len(parentSeed))
+	}
 
 	pe := &pendingIntent{
-		RMsg: RMsg{Code: RMsgIntent},
+		Alpha: make([]byte, 32),
+		RMsg:  RMsg{Code: RMsgIntent},
 	}
+	copy(pe.Alpha, parentSeed)
 
 	pe.SealHash = Hash(et.Committer.CurrentBlockHash())
 
@@ -316,36 +324,26 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 		return false, nil
 	}
 
-	// Work out the stable seed. We want to take this from a block that we are
-	// probabalistically very confident is part of the canonical chain. 'd'
-	// rounds before the current. Here we deal with the early blocks where d >
-	// block height.
-	alpha := r.genesisEx.ChainInit.Seed
-
-	blockNumber := r.Number.Uint64()
-	if r.config.StablePrefixDepth < blockNumber {
-
-		stableHeader := chain.GetHeaderByNumber(blockNumber - r.config.StablePrefixDepth)
-		se, _, _, err := r.codec.DecodeHeaderSeal(stableHeader)
-		if err != nil {
-			return false, fmt.Errorf("failed decoding stable header seal: %v", err)
-		}
-		alpha = se.Seed
-	}
-
-	beta, pi, err := r.vrf.Prove(r.privateKey, alpha)
+	// The alpha here is always from the block we are building on, which is updated by refreshSealTask
+	beta, pi, err := r.vrf.Prove(r.privateKey, r.intent.Alpha)
 	if err != nil {
 		return false, fmt.Errorf("failed proving new seed: %v", err)
 	}
 
+	sealTimeBytes, err := time.Now().UTC().MarshalBinary()
+	if err != nil {
+		return false, fmt.Errorf("failed marshaling seal time: %v", err)
+	}
 	data := &SignedExtraData{
 		ExtraData: ExtraData{
-			SealTime: uint64(time.Now().Unix()),
-			Intent:   r.intent.SI.Intent,
-			Confirm:  make([]Endorsement, len(r.intent.Endorsements)),
-			Enrol:    make([]Enrolment, len(r.pendingEnrolments)),
-			Seed:     beta,
-			Proof:    pi,
+			ExtraHeader: ExtraHeader{
+				SealTime: sealTimeBytes,
+				Seed:     beta,
+				Proof:    pi,
+				Enrol:    make([]Enrolment, len(r.pendingEnrolments)),
+			},
+			Intent:  r.intent.SI.Intent,
+			Confirm: make([]Endorsement, len(r.intent.Endorsements)),
 		},
 	}
 

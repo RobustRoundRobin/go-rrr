@@ -3,6 +3,7 @@ package rrr
 import (
 	"crypto/ecdsa"
 	"encoding/hex"
+	"fmt"
 	"math/big"
 	"math/rand"
 	"sync"
@@ -48,12 +49,24 @@ const (
 	// RoundPhaseConfirm During the confirmation phase leaders are waiting for
 	// all the endorsements to come in so they fairly represent activity.
 	RoundPhaseConfirm
+
+	// RoundPhaseBroadcast during the Broadcast phase all nodes are waiting for
+	// a NewChainHead event for the current round (including the c nsensus
+	// leaders). Any node receiving an otherwise valid HEAD for a different
+	// round must align with the round on the recieved head.
+	RoundPhaseBroadcast
 )
 
 type headerByNumberChainReader interface {
 
 	// GetHeaderByNumber retrieves a block header from the database by number.
 	GetHeaderByNumber(number uint64) BlockHeader
+}
+
+type headerByHashChainReader interface {
+
+	// GetHeaderByNumber retrieves a block header from the database by number.
+	GetHeaderByHash([32]byte) BlockHeader
 }
 
 // EndorsmentProtocol implements  5.2 "Endorsement Protocol" and 5.3 "Chain
@@ -67,16 +80,27 @@ type EndorsmentProtocol struct {
 	codec *CipherCodec
 
 	// Node and chain context
-	config     *Config
-	genesisEx  GenesisExtraData
-	privateKey *ecdsa.PrivateKey
-	nodeID     Hash // derived from privateKey
+	config          *Config
+	genesisEx       GenesisExtraData
+	genesisSealTime time.Time
+	privateKey      *ecdsa.PrivateKey
+	nodeID          Hash // derived from privateKey
 
 	nodeAddr Address
 
-	vrf  ecvrf.VRF
-	T    *RoundTime
-	Rand *rand.Rand
+	vrf ecvrf.VRF
+	T   RoundTime
+
+	samplesTaken int
+	Rand         *rand.Rand
+	roundStart   time.Time
+	// Updated in the NewChainHead method
+	chainHead            BlockHeader
+	chainHeadExtraHeader *ExtraHeader     // genesis & consensus blocks
+	chainHeadExtra       *SignedExtraData // consensus blocks only
+	chainHeadRound       *big.Int
+	seedRound            *big.Int
+	chainHeadSealTime    time.Time
 
 	Phase RoundPhase
 
@@ -88,7 +112,7 @@ type EndorsmentProtocol struct {
 	state RoundState
 
 	Number         *big.Int
-	FailedAttempts uint
+	FailedAttempts uint32
 
 	OnlineEndorsers map[Address]Peer
 
@@ -127,12 +151,21 @@ func NewRoundState(
 		nodeAddr: PubToAddress(codec.c, &key.PublicKey),
 		config:   config,
 		vrf:      ecvrf.NewSecp256k1Sha256Tai(),
-		T:        NewRoundTime(config.RoundLength, config.ConfirmPhase, logger),
+		T:        NewRoundTime(config, logger),
 
 		pendingEnrolments: make(map[Hash]*EnrolmentBinding),
 
-		Number: new(big.Int),
+		chainHeadRound: new(big.Int),
+		seedRound:      new(big.Int),
+		Number:         new(big.Int),
 	}
+
+	if logger != nil {
+		logger.Trace(
+			"RRR NewRoundState - timer durations",
+			"round", roundDuration, "i", t.Intent, "c", t.Confirm, "b", t.Broadcast)
+	}
+
 	return s
 }
 
@@ -164,7 +197,11 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 		r.logger.Info("RRR CheckGenesis", "extraData", hex.EncodeToString(extra))
 		err := r.codec.DecodeGenesisExtra(extra, &r.genesisEx)
 		if err != nil {
-			r.logger.Debug("RRR CheckGenesis", "err", err)
+			r.logger.Debug("RRR CheckGenesis - decode extra", "err", err)
+			return err
+		}
+		if err := r.genesisSealTime.UnmarshalBinary(r.genesisEx.ChainInit.SealTime); err != nil {
+			r.logger.Debug("RRR CheckGenesis - unmarshal seal time", "err", err)
 			return err
 		}
 	}
@@ -173,9 +210,26 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 		r.logger.Debug("RRR CheckGenesis", "err", err)
 		return err
 	}
-	r.logger.Debug("RRR CheckGenesis", "genid", r.genesisEx.IdentInit[0].ID.Hex())
+	r.logger.Debug("RRR CheckGenesis", "genid", r.genesisEx.Enrol[0].ID.Hex())
 
 	return nil
+}
+
+func (r *EndorsmentProtocol) StableSeed(chain EngineChainReader, headNumber uint64) (uint64, uint64, error) {
+	if r.config.StablePrefixDepth >= headNumber {
+		seed, err := ConditionSeed(r.genesisEx.Seed)
+		return seed, 0, err
+	}
+	stableHeader := chain.GetHeaderByNumber(headNumber - r.config.StablePrefixDepth)
+	if stableHeader == nil {
+		return 0, 0, fmt.Errorf("block at stablePrefixDepth not found: %d - %d", headNumber, r.config.StablePrefixDepth)
+	}
+	se, _, _, err := r.codec.DecodeHeaderSeal(stableHeader)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed decoding stable header seal: %v", err)
+	}
+	seed, err := ConditionSeed(se.Seed)
+	return seed, se.Intent.RoundNumber.Uint64(), err
 }
 
 // PrimeActiveSelection should be called for engine Start
@@ -213,19 +267,20 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 	// So set the failedCount based in the interval between the last block being
 	// sealed and 'now'
 
-	// Note: we assume quorum/geth for now, and that means this timestamp is nanoseconds
-	blocktime := (time.Duration(header.GetTime()) * time.Nanosecond)
+	blocktime := (time.Duration(header.GetTime()) * time.Second)
 
-	// RoundLength is in milliseconds. Calculate how many rounds *this* node has
-	// missed since the block was minted. And set FailedAttempts to match. If
-	// only this block has been down or off line, the effects of this will reset
-	// as soon as we see the next block. If the whole network is down - common
-	// for development and some private network scenarios, it will start
-	// everyone off on the same notion of what round it is. This is consistent
-	// with what the paper essentially does for every round. In the paper round
-	// number is always t-now / round time.
-	r.FailedAttempts = uint(blocktime / time.Duration(r.config.RoundLength) * time.Millisecond)
+	if r.config.RoundAgreement != RoundAgreementNTP {
 
+		// RoundLength is in seconds. Calculate how many rounds *this* node has
+		// missed since the block was minted. And set FailedAttempts to match. If
+		// only this block has been down or off line, the effects of this will reset
+		// as soon as we see the next block. If the whole network is down - common
+		// for development and some private network scenarios, it will start
+		// everyone off on the same notion of what round it is. This is consistent
+		// with what the paper essentially does for every round. In the paper round
+		// number is always t-now / round time.
+		r.FailedAttempts = uint32(blocktime / (time.Duration(r.config.RoundLength) * time.Second))
+	}
 	return nil
 }
 
@@ -273,9 +328,7 @@ func (r *EndorsmentProtocol) NewSignedIntent(et *EngSignedIntent) {
 		r.logger.Trace("RRR engSignedIntent - need block, ignoring", "et.round", et.RoundNumber)
 		return
 	}
-	// See RRR-spec.md for a more thorough explanation, and for why we don't
-	// check the round phase or whether or not we - locally - have selected
-	// ourselves as an endorser. handleIntent.
+
 	r.logger.Trace("RRR run got engSignedIntent",
 		"round", r.Number, "cand-round", et.RoundNumber, "cand-attempts", et.FailedAttempts,
 		"candidate", et.NodeID.Hex(), "parent", et.ParentHash.Hex())
@@ -309,9 +362,22 @@ func (r *EndorsmentProtocol) NewSignedIntent(et *EngSignedIntent) {
 func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 
 	var err error
+	// See RRR-spec.md for a more thorough explanation, and for why (for the
+	// blockclock model) we don't check the round phase or whether or not we -
+	// locally - have selected ourselves as an endorser.
 
 	// Do we agree that the intendee is next in line and that their intent is
 	// appropriate ?
+
+	if r.config.RoundAgreement == RoundAgreementNTP {
+		if !r.endorsers[r.nodeAddr] {
+			return fmt.Errorf("RRR handleIntent - not selected as an endorser, ignoring intent for round %d", et.RoundNumber)
+		}
+
+		if r.Phase != RoundPhaseIntent {
+			return fmt.Errorf("RRR handleIntent - not in intent phase, ignoring intent for round %d", et.RoundNumber)
+		}
+	}
 
 	// Check that the public key recovered from the intent signature matches
 	// the node id declared in the intent
@@ -340,7 +406,7 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	// leader candidate. According to the (matching) roundNumber and their
 	// provided value for FailedAttempts
 	if !r.a.LeaderForRoundAttempt(
-		uint(r.config.Candidates), uint(r.config.Endorsers),
+		uint32(r.config.Candidates), uint32(r.config.Endorsers),
 		intenderAddr, et.Intent.FailedAttempts) {
 		r.logger.Info(
 			"RRR handleIntent - intent from non-candidate",

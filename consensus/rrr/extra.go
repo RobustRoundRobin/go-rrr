@@ -4,16 +4,19 @@ import (
 	"crypto/ecdsa"
 )
 
-// ExtraData is the complete (minus sig) RRR consensus data included on each block
-type ExtraData struct {
-	// SealTime is not part of the protocol. It is used for reporting
-	// disemination latencey. It is the unix time on the sealers system.
-	SealTime uint64
-	Intent   Intent
-	Confirm  []Endorsement
-	Enrol    []Enrolment
+// ExtraHeader is the common header for the genesis block and consensus produced blocks
+type ExtraHeader struct {
+	SealTime []byte // result of time.Now().UTC().MarshalBinary() at seal time
 	Seed     []byte // VRF beta output, alpha is previous seed
 	Proof    []byte // VRF proof
+	Enrol    []Enrolment
+}
+
+// ExtraData is the complete (minus sig) RRR consensus data included on each block
+type ExtraData struct {
+	ExtraHeader
+	Intent  Intent
+	Confirm []Endorsement
 }
 
 // SignedExtraData is ExtraData with signature

@@ -2,8 +2,9 @@ package rrr
 
 // Config carries the RRR consensus configuration
 type Config struct {
-	ConfirmPhase uint64 `toml:",omitempty"` // Duration of the confirmation phase in milliseconds (must be < round)
-	RoundLength  uint64 `toml:",omitempty"` // Duration of each round in milliseconds
+	RoundAgreement string `toml:",,omitempty"` // block is the round or round == time % roundlength
+	ConfirmPhase   uint64 `toml:",omitempty"`  // Duration of the confirmation phase in milliseconds (must be < round)
+	RoundLength    uint64 `toml:",omitempty"`  // Duration of each round in seconds
 
 	Candidates        uint64 `toml:",omitempty"` // Number of leader candidates (Nc) to propose from the oldest identities on each round
 	Endorsers         uint64 `toml:",omitempty"` // Number of endorsers (Ne) to select from the most recently active identities
@@ -14,11 +15,12 @@ type Config struct {
 
 // DefaultConfig provides the default rrr consensus configuration
 var DefaultConfig = &Config{
-	ConfirmPhase:      5000,
-	RoundLength:       6000,
-	Candidates:        5,
-	Endorsers:         100,
-	Quorum:            54,
+	RoundAgreement:    "blockclock",
+	ConfirmPhase:      3500,
+	RoundLength:       6,
+	Candidates:        2,
+	Endorsers:         7,
+	Quorum:            4,
 	Activity:          200,
-	StablePrefixDepth: 12,
+	StablePrefixDepth: 6,
 }

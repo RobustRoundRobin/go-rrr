@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/vechain/go-ecvrf"
 	"golang.org/x/crypto/sha3"
@@ -31,11 +32,8 @@ type Alpha struct {
 // ChainInit holds the RRR consensus genesis configuration, including
 // genesis enroled identities
 type ChainInit struct {
-	IdentInit []Enrolment
-	Alpha     []Alpha // one per enrolment, contributions are catenated in ident genesis age order
-	He        Hash    // Always zero, as there is no enclave code to hash
-	Seed      []byte  // beta output of VRF(alpha).
-	Proof     []byte  // pi ouptut of VRF(alpha)
+	ExtraHeader
+	Alpha []Alpha // one per enrolment, contributions are catenated in ident genesis age order
 }
 
 // GenesisExtraData  adds the ChainID which is the hash of the ChainInit
@@ -155,14 +153,20 @@ func (codec *CipherCodec) PopulateChainInit(
 		return err
 	}
 
-	ci.IdentInit = make([]Enrolment, len(initIdents))
-	copy(ci.IdentInit, initIdents)
+	ci.Enrol = make([]Enrolment, len(initIdents))
+	copy(ci.Enrol, initIdents)
 
 	ci.Seed = make([]byte, len(seed))
 	copy(ci.Seed, seed)
 
 	ci.Proof = make([]byte, len(proof))
 	copy(ci.Proof, proof)
+
+	b, err := time.Now().UTC().MarshalBinary()
+	if err != nil {
+		return err
+	}
+	ci.SealTime = b
 
 	return nil
 }

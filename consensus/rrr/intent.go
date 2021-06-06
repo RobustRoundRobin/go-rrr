@@ -17,7 +17,7 @@ type Intent struct {
 	// on the node without a new block being produced. The validity of the
 	// proposer as a leader is depedent on both the RoundNumber and the
 	// FailedAttempts
-	FailedAttempts uint
+	FailedAttempts uint32
 	// ParentHash parent block hash
 	ParentHash Hash
 	// TxHash is the hash of the transactions (merkle root for block)

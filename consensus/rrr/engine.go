@@ -11,7 +11,14 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 )
 
+const (
+	RoundAgreementDefault    = ""
+	RoundAgreementBlockClock = "blockclock"
+	RoundAgreementNTP        = "ntp"
+)
+
 var (
+	ErrRoundAgreementInvalid   = errors.New("'blockclock' or 'ntp' are the only supported methods")
 	ErrConfirmPhaseToLarge     = errors.New("confirm phase can not be longer than the round")
 	ErrIncompatibleChainReader = errors.New("chainreader missing required interfaces for RRR")
 	ErrNoGenesisHeader         = errors.New("failed to get genesis header")
@@ -77,6 +84,10 @@ type Engine struct {
 	privateKey *ecdsa.PrivateKey
 	logger     Logger
 
+	// If set, called when candidates fail there round attempt. It is expected
+	// to check for clock drift and take appropriate action (ie log a warning)
+	clockChecker func()
+
 	peerFinder PeerFinder
 
 	// must be held for any interaction with ARCCache *Messages members
@@ -141,15 +152,36 @@ func (e *Engine) IsEnrolmentPending(nodeID [32]byte) bool {
 	return e.r.IsEnrolmentPending(nodeID)
 }
 
-// ConfigureNew a new instance of the rrr consensus engine. Assumes the provided
+type EngineOption func(e *Engine)
+
+func WithClockCheck(checker func()) EngineOption {
+	return func(e *Engine) {
+		e.clockChecker = checker
+	}
+}
+
+// NewEngine a new instance of the rrr consensus engine. Assumes the provided
 // engine instance is new.
 func NewEngine(
 	config *Config, codec *CipherCodec,
-	privateKey *ecdsa.PrivateKey, logger Logger) (*Engine, error) {
+	privateKey *ecdsa.PrivateKey, logger Logger, opts ...EngineOption) (*Engine, error) {
 
-	if config.ConfirmPhase > config.RoundLength {
+	if config.ConfirmPhase > config.RoundLength*1000 {
 		return nil, fmt.Errorf("confirm=%v, round=%v: %w", config.ConfirmPhase, config.RoundLength, ErrConfirmPhaseToLarge)
 	}
+
+	switch config.RoundAgreement {
+	case RoundAgreementDefault:
+		logger.Debug("defaulting to blockclock round agreement")
+		config.RoundAgreement = RoundAgreementBlockClock
+	case RoundAgreementBlockClock:
+	case RoundAgreementNTP:
+	default:
+		return nil, fmt.Errorf(
+			"roundagrement '%s' unknown: %w",
+			config.RoundAgreement, ErrRoundAgreementInvalid)
+	}
+	logger.Info("round agreement", "method", config.RoundAgreement)
 
 	// Only get err from NewRC if zize requested is <=0
 	peerMessages, err := lru.NewARC(lruPeers)
@@ -170,6 +202,11 @@ func NewEngine(
 		peerMessages: peerMessages,
 		selfMessages: selfMessages,
 	}
+
+	for _, o := range opts {
+		o(e)
+	}
+
 	return e, nil
 }
 
@@ -548,7 +585,7 @@ func (e *Engine) VerifySeal(chain VerifyBranchChainReader, header BlockHeader) e
 	return nil
 }
 
-func (e *Engine) VerifyHeader(chain headerByNumberChainReader, header BlockHeader) error {
+func (e *Engine) VerifyHeader(chain headerByHashChainReader, header BlockHeader) error {
 	_, err := e.r.VerifyHeader(chain, header)
 	return err
 }
@@ -571,9 +608,9 @@ func (e *Engine) Author(header BlockHeader) (Address, error) {
 	sealingNodeAddr := sealerID.Address()
 
 	if sealingNodeAddr == e.r.nodeAddr {
-		e.logger.Debug("RRR Author - sealed by self", "addr", sealingNodeAddr, "bn", header.GetNumber())
+		e.logger.Debug("RRR Author - sealed by self", "addr", sealingNodeAddr.Hex(), "bn", header.GetNumber())
 	} else {
-		e.logger.Debug("RRR Author sealed by", "addr", sealingNodeAddr, "bn", header.GetNumber())
+		e.logger.Debug("RRR Author sealed by", "addr", sealingNodeAddr.Hex(), "bn", header.GetNumber())
 	}
 	return sealingNodeAddr, nil
 }

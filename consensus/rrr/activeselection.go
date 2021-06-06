@@ -19,6 +19,7 @@ var (
 	errEnrolmentNotSignedBySealer = errors.New("identity enrolment was not indidualy signed by the block sealer")
 	ErrBranchDetected             = errors.New("branch detected")
 	errInsuficientActiveIdents    = errors.New("not enough active identities found")
+	errPermutationToShort         = errors.New("need n(active) - candidates items in the permutation")
 	big0                          = big.NewInt(0)
 	zeroAddr                      = Address{}
 	zeroHash                      = Hash{}
@@ -329,15 +330,13 @@ func (a *ActiveSelection) logSealerAge(cur BlockHeader, blockActivity *BlockActi
 	)
 }
 
-type randPerm func(int) []int
-
 // SelectCandidatesAndEndorsers determines if the current node is a leader
 // candidate and what the current endorsers are. The key requirement of RRR met
 // here  is that the results of this function should be the same on all nodes
 // assuming they run accumulateActive starting from the same `head' block. This
 // is both SelectCandidates and SelectEndorsers from the paper.
 func (a *ActiveSelection) SelectCandidatesAndEndorsers(
-	randPerm randPerm, nCandidates, nEndorsers, quorum, activityHorizon, failedAttempts uint,
+	permutation []int, nCandidates, nEndorsers, quorum, activityHorizon, failedAttempts uint32,
 ) (map[Address]bool, map[Address]bool, []Address, error) {
 
 	// Start with the oldest identity, and iterate towards the youngest. Move
@@ -363,16 +362,19 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 	// for details. failedAttempts tracked the number of times the local node
 	// timer has expired withoug a block being produced.
 
-	nActive := uint(a.activeSelection.Len())
-	if nActive < uint(nCandidates+quorum) {
+	nActive := uint32(a.activeSelection.Len())
+
+	if len(permutation) < a.activeSelection.Len()-int(nCandidates) {
 		return nil, nil, nil, fmt.Errorf(
-			"%v < %v(c) + %v(q), len(idle)=%v:%w", nActive, nCandidates, quorum, len(a.idlePool), errInsuficientActiveIdents)
+			"%d < %d:%w", len(permutation), a.activeSelection.Len()-int(nCandidates),
+			errPermutationToShort)
 	}
 
 	iFirstLeader, iLastLeader := a.calcLeaderWindow(nCandidates, nEndorsers, nActive, failedAttempts)
 	a.logger.Trace(
 		"RRR selectCandEs", "na", nActive, "agelen", len(a.aged), "idle", len(a.idlePool),
-		"f", failedAttempts, "if", iFirstLeader, "self", a.selfNodeID.Hex())
+		"f", failedAttempts, "if", iFirstLeader,
+		"self", a.selfNodeID.Address().Hex(), "selfID", a.selfNodeID.Hex())
 
 	candidates := make(map[Address]bool)
 	endorsers := make(map[Address]bool)
@@ -385,13 +387,13 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 	// leader candidates don't consume 'positions'
 	pendingEndorserPositions := map[int]bool{}
 
-	// Get a random permutation of ALL active identities eligible as endorsers,
-	// then take the first e.config.Endorsers in that permutation. This gives
-	// us a random selection of endorsers with replacement.
-	permutation := randPerm(int(nActive) - int(nCandidates))
+	// The permutation is over n(active) - nc, we take the first ne in that
+	// permutation. This gives us a random selection of endorsers *without*
+	// replacement - (the paper calls for with). Note that the state of the DRGB
+	// is advanced nActive - nCandidate times.
 	iend := nEndorsers
-	if uint(len(permutation)) < iend {
-		iend = uint(len(permutation))
+	if uint32(len(permutation)) < iend {
+		iend = uint32(len(permutation))
 	}
 	permutation = permutation[:iend]
 	for _, r := range permutation {
@@ -425,7 +427,7 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 		// we have enough of *both* (or at the end of the list)
 
 		if icur >= iFirstLeader && icur <= iLastLeader &&
-			uint(len(candidates)) < nCandidates {
+			uint32(len(candidates)) < nCandidates {
 
 			// A candidate that is oldest for Nc rounds is moved to the idle pool
 			if len(candidates) == 0 && failedAttempts == 0 {
@@ -441,8 +443,12 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 			// rounds and attempts. But its a little tricky, it essentially
 			// involves moving the window.
 			if age.oldestFor > int(nCandidates) {
-				a.logger.Info("RRR selectCandEs - unresponsive node (droping tbd)",
+				a.logger.Debug("RRR selectCandEs - droping unresponsive node TBD",
 					"nodeid", age.nodeID.Address().Hex(), "oldestFor", age.oldestFor)
+
+				// a.activeSelection.Remove(cur)
+				// a.idlePool[age.nodeID.Address()] = age
+				// continue
 			}
 
 			selection = append(selection, Address(addr)) // telemetry only
@@ -496,7 +502,7 @@ func (a *ActiveSelection) SelectCandidatesAndEndorsers(
 
 func (a *ActiveSelection) logSelection(
 	candidates map[Address]bool, endorsers map[Address]bool,
-	selection []Address, nCandidates, nEndorsers uint) {
+	selection []Address, nCandidates, nEndorsers uint32) {
 
 	a.logger.Debug("RRR selectCandEs selected", "", a.logger.LazyValue(
 		func() string {
@@ -539,9 +545,9 @@ func (a *ActiveSelection) logSelection(
 // LeaderForRoundAttempt determines if the provided identity was selected as
 // leader for the current round given the provided failedAttempts
 func (a *ActiveSelection) LeaderForRoundAttempt(
-	nCandidates, nEndorsers uint, id Address, failedAttempts uint) bool {
+	nCandidates, nEndorsers uint32, id Address, failedAttempts uint32) bool {
 
-	nActive := uint(a.activeSelection.Len())
+	nActive := uint32(a.activeSelection.Len())
 	iFirstLeader, iLastLeader := a.calcLeaderWindow(
 		nCandidates, nEndorsers, nActive, failedAttempts)
 
@@ -785,7 +791,7 @@ func (a *ActiveSelection) refreshAge(
 }
 
 // Is the number within Ta blocks of the block head ?
-func (a *ActiveSelection) withinActivityHorizon(activity uint, blockNumber *big.Int) bool {
+func (a *ActiveSelection) withinActivityHorizon(activity uint32, blockNumber *big.Int) bool {
 
 	// Note that activeBlockFence is intialised to the head block in Start
 
@@ -810,7 +816,7 @@ func (a *ActiveSelection) withinActivityHorizon(activity uint, blockNumber *big.
 }
 
 func (a *ActiveSelection) calcLeaderWindow(
-	nCandidates, nEndorsers, nActive, failedAttempts uint) (uint, uint) {
+	nCandidates, nEndorsers, nActive, failedAttempts uint32) (uint, uint) {
 
 	// a = active mod  [ MAX (n active, Nc + Ne) ]
 	na := float64(nActive)
@@ -818,13 +824,13 @@ func (a *ActiveSelection) calcLeaderWindow(
 	max := math.Max(na, nc+ne)
 	amod, _ := math.Modf(math.Mod(float64(failedAttempts), max))
 
-	iFirstLeader := uint(math.Floor(amod/nc) * nc)
+	iFirstLeader := uint32(math.Floor(amod/nc) * nc)
 	iLastLeader := iFirstLeader + nCandidates - 1
 
 	a.logger.Trace(
 		"RRR calcLeaderWindow", "na", na, "f", failedAttempts, "nc+ne", nc+ne,
 		"max", max, "a", amod, "if", iFirstLeader)
-	return iFirstLeader, iLastLeader
+	return uint(iFirstLeader), uint(iLastLeader)
 }
 
 // The cursor arrangement only exists to support testing
