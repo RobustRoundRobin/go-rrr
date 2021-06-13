@@ -55,6 +55,11 @@ const (
 	// leaders). Any node receiving an otherwise valid HEAD for a different
 	// round must align with the round on the recieved head.
 	RoundPhaseBroadcast
+
+	// Used to absorb and align the start time with the round time. Means we
+	// can deal with most initialisation the same as we do the end of the
+	// Broadcast round *and* we may get a block while we wait.
+	RoundPhaseStartup
 )
 
 type headerByNumberChainReader interface {
@@ -131,15 +136,15 @@ type EndorsmentProtocol struct {
 	pendingEnrolmentsMu sync.RWMutex
 	pendingEnrolments   map[Hash]*EnrolmentBinding
 
-	a *ActiveSelection
+	a ActiveSelection
 }
 
 // NewRoundState creates and initialises a RoundState
 func NewRoundState(
 	codec *CipherCodec, key *ecdsa.PrivateKey, config *Config, logger Logger,
-) EndorsmentProtocol {
+) *EndorsmentProtocol {
 
-	r := EndorsmentProtocol{
+	r := &EndorsmentProtocol{
 		logger:     logger,
 		privateKey: key,
 		codec:      codec,
@@ -153,7 +158,6 @@ func NewRoundState(
 		pendingEnrolments: make(map[Hash]*EnrolmentBinding),
 
 		chainHeadRound: new(big.Int),
-		seedRound:      new(big.Int),
 		Number:         new(big.Int),
 	}
 
@@ -220,7 +224,8 @@ func (r *EndorsmentProtocol) StableSeed(chain EngineChainReader, headNumber uint
 	}
 	stableHeader := chain.GetHeaderByNumber(headNumber - r.config.StablePrefixDepth)
 	if stableHeader == nil {
-		return 0, 0, fmt.Errorf("block at stablePrefixDepth not found: %d - %d", headNumber, r.config.StablePrefixDepth)
+		return 0, 0, fmt.Errorf(
+			"block at stablePrefixDepth not found: %d - %d", headNumber, r.config.StablePrefixDepth)
 	}
 	se, _, _, err := r.codec.DecodeHeaderSeal(stableHeader)
 	if err != nil {
@@ -247,38 +252,6 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 	header := chain.CurrentHeader()
 	r.a.Reset(r.config.Activity, header)
 
-	// Implicit dependnecy on ntp for 'block is the clock' model. assume that
-	// the timestamp on the last block was acceptable to the network. The
-	// ethereum yellow paper, for PoW, adjusts difficulty to maintain
-	// homeostasis in the block time interval. This in turn requires that
-	// ethereum nodes have some loosely synchronised view of time. geth uses ntp
-	// to achieve this. etherum SO is full of people not being able to sync
-	// because their node host clocks are out of whack. All of this means 2
-	// things:
-	//   1. Actually, the requirement for loosely synchronised time in rrr
-	//      is no big deal, and we can infact *count* on it in geth.
-	//   2. For the 'block is the clock model' we can safely reduce the
-	//      dependency on ntp in general to just "loosely syncrhonised network" at
-	//      the time of the last block - and our local clock being (currently) good
-	//      relative to the last block time.
-	//
-	// So set the failedCount based in the interval between the last block being
-	// sealed and 'now'
-
-	blocktime := (time.Duration(header.GetTime()) * time.Second)
-
-	if r.config.RoundAgreement != RoundAgreementNTP {
-
-		// RoundLength is in seconds. Calculate how many rounds *this* node has
-		// missed since the block was minted. And set FailedAttempts to match. If
-		// only this block has been down or off line, the effects of this will reset
-		// as soon as we see the next block. If the whole network is down - common
-		// for development and some private network scenarios, it will start
-		// everyone off on the same notion of what round it is. This is consistent
-		// with what the paper essentially does for every round. In the paper round
-		// number is always t-now / round time.
-		r.FailedAttempts = uint32(blocktime / (time.Duration(r.config.RoundLength) * time.Second))
-	}
 	return nil
 }
 
@@ -367,14 +340,13 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	// Do we agree that the intendee is next in line and that their intent is
 	// appropriate ?
 
-	if r.config.RoundAgreement == RoundAgreementNTP {
-		if !r.endorsers[r.nodeAddr] {
-			return fmt.Errorf("RRR handleIntent - not selected as an endorser, ignoring intent for round %d", et.RoundNumber)
-		}
+	// XXX: TODO NTP rounds only for endorser and Phase check ?
+	if !r.endorsers[r.nodeAddr] {
+		return fmt.Errorf("RRR handleIntent - not selected as an endorser, ignoring intent for round %d", et.RoundNumber)
+	}
 
-		if r.Phase != RoundPhaseIntent {
-			return fmt.Errorf("RRR handleIntent - not in intent phase, ignoring intent for round %d", et.RoundNumber)
-		}
+	if r.Phase != RoundPhaseIntent {
+		return fmt.Errorf("RRR handleIntent - not in intent phase, ignoring intent for round %d", et.RoundNumber)
 	}
 
 	// Check that the public key recovered from the intent signature matches
@@ -415,8 +387,8 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	if r.signedIntent != nil {
 		// It must be in the map if it was active, otherwise we have a
 		// programming error.
-		curAge := r.a.aged[r.signedIntent.NodeID.Address()].Value.(*idActivity).ageBlock
-		newAge := r.a.aged[intenderAddr].Value.(*idActivity).ageBlock
+		curAge := r.a.AgeOf(r.signedIntent.NodeID.Address())
+		newAge := r.a.AgeOf(intenderAddr)
 
 		// Careful here, the 'older' block will have the *lower* number
 		if curAge.Cmp(newAge) < 0 {

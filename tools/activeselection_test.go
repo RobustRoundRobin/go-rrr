@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/RobustRoundRobin/go-rrr/consensus/rrr"
 	"github.com/RobustRoundRobin/go-rrr/secp256k1suite"
@@ -29,6 +30,13 @@ var (
 	dummyProof = []byte{0, 1, 2, 3, 4, 5, 6, 7}
 	bigOne     = new(big.Int).SetInt64(1)
 )
+
+func makeTimeStamp(t *testing.T, sec int64, nsec int64) []byte {
+	ts := time.Unix(sec, nsec)
+	b, err := ts.MarshalBinary()
+	require.Nil(t, err)
+	return b
+}
 
 func TestDecodeGenesisActivity(t *testing.T) {
 
@@ -74,7 +82,8 @@ func TestDecodeActivity(t *testing.T) {
 	se2 := requireMakeSignedEndorsement(t, ge.ChainID, keys[2], intent)
 
 	_, data = requireMakeSignedExtraData(t,
-		keys[0], 0, intent, []*rrr.SignedEndorsement{se1, se2}, []byte{8, 9, 10, 11, 12, 13, 14, 15})
+		keys[0], makeTimeStamp(t, 0, 0),
+		intent, []*rrr.SignedEndorsement{se1, se2}, []byte{8, 9, 10, 11, 12, 13, 14, 15})
 
 	block1 := makeBlockHeader(withNumber(1), withSeal(data))
 	a := &rrr.BlockActivity{}
@@ -92,7 +101,7 @@ func NewLogger(l log.Logger) *Logger {
 	return &Logger{L: l}
 }
 
-func NewActiveSelection(codec *rrr.CipherCodec, logger rrr.Logger) *rrr.ActiveSelection {
+func NewActiveSelection(codec *rrr.CipherCodec, logger rrr.Logger) rrr.ActiveSelection {
 	a := rrr.NewActiveSelection(codec, rrr.Hash{1, 2, 3}, logger)
 	return a
 }
@@ -119,7 +128,7 @@ func TestAccumulateGenesisActivity(t *testing.T) {
 		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
 
 	require.NoError(err)
-	assert.Equal(a.Len(), numIdents, "missing active from selection")
+	assert.Equal(a.NumActive(), numIdents, "missing active from selection")
 
 	// For the genesis block, the age ordering should exactly match the
 	// enrolment order. And the identity that signed the genesis block should be
@@ -152,9 +161,9 @@ func TestFirstAccumulate(t *testing.T) {
 		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
 
 	require.NoError(err)
-	assert.Equal(a.LenAged(), 3, "missing active from aged")
-	assert.Equal(a.Len(), 3, "missing active from selection")
-	assert.Equal(a.LenIdle(), 0, "idle identities found")
+	assert.Equal(a.NumKnown(), 3, "missing active from aged")
+	assert.Equal(a.NumActive(), 3, "missing active from selection")
+	assert.Equal(a.NumIdle(), 0, "idle identities found")
 
 	// the youngest identity should be at the front and should be the id=0
 	id, ok := net.nodeID2id[a.YoungestNodeID()]
@@ -306,7 +315,7 @@ func TestShortActityHorizon(t *testing.T) {
 	net.requireOrder(t, a, order)
 }
 
-func (net *network) requireOrder(t *testing.T, a *rrr.ActiveSelection, order []int) {
+func (net *network) requireOrder(t *testing.T, a rrr.ActiveSelection, order []int) {
 
 	nok := 0
 
@@ -417,7 +426,7 @@ func newNetwork(t *testing.T, numIdents int) *network {
 }
 
 func (net *network) newIntent(
-	idFrom int, parent rrr.BlockHeader, failedAttempts uint) *rrr.Intent {
+	idFrom int, parent rrr.BlockHeader, failedAttempts uint32) *rrr.Intent {
 	key := net.id2key[idFrom]
 	require.NotZero(net.t, key)
 
@@ -446,7 +455,8 @@ func (net *network) sealBlock(
 	key := net.id2key[idSealer]
 	require.NotZero(net.t, key)
 
-	_, data := requireMakeSignedExtraData(net.t, key, 0, intent, confirm, dummySeed)
+	_, data := requireMakeSignedExtraData(
+		net.t, key, makeTimeStamp(net.t, 0, 0), intent, confirm, dummySeed)
 
 	return makeBlockHeader(
 		withNumber(intent.RoundNumber.Int64()),
@@ -457,15 +467,17 @@ func (net *network) sealBlock(
 func requireMakeSignedExtraData(
 	t *testing.T,
 	sealer *ecdsa.PrivateKey,
-	sealTime uint64, intent *rrr.Intent, confirm []*rrr.SignedEndorsement,
+	sealTime []byte, intent *rrr.Intent, confirm []*rrr.SignedEndorsement,
 	seed []byte,
 ) (*rrr.SignedExtraData, []byte) {
 
 	data := &rrr.SignedExtraData{
 		ExtraData: rrr.ExtraData{
-			SealTime: sealTime,
-			Intent:   *intent,
-			Confirm:  make([]rrr.Endorsement, len(confirm)),
+			ExtraHeader: rrr.ExtraHeader{
+				SealTime: sealTime,
+			},
+			Intent:  *intent,
+			Confirm: make([]rrr.Endorsement, len(confirm)),
 		},
 	}
 	data.Intent.RoundNumber = big.NewInt(0).Set(intent.RoundNumber)
@@ -505,7 +517,7 @@ func requireMakeSignedEndorsement(
 func fillIntent(
 	i *rrr.Intent,
 	chainID rrr.Hash, proposer *ecdsa.PrivateKey,
-	parent rrr.BlockHeader, roundNumber *big.Int, failedAttempts uint) *rrr.Intent {
+	parent rrr.BlockHeader, roundNumber *big.Int, failedAttempts uint32) *rrr.Intent {
 
 	c := secp256k1suite.NewCipherSuite()
 

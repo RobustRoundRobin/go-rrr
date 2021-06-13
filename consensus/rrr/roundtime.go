@@ -7,10 +7,10 @@ import (
 // RoundTime takes (some) of the sharp edges of go's time.Timer and provides
 // conveniences for manaing the time based RRR state
 type RoundTime struct {
-	config    *Config
-	Confirm   time.Duration
-	Intent    time.Duration
-	Broadcast time.Duration
+	Confirm     time.Duration
+	Intent      time.Duration
+	Broadcast   time.Duration
+	RoundLength time.Duration
 
 	// Ticker has to be public, but use Start and StopTicker. The only
 	// legitemate direct use is <-t.Ticker.C in a select case. And that is only
@@ -19,7 +19,6 @@ type RoundTime struct {
 	// https://blogtitle.github.io/go-advanced-concurrency-patterns-part-2-timers/
 
 	Ticker *time.Timer
-	logger Logger
 }
 
 type RoundTimeOption func(r *RoundTime)
@@ -31,9 +30,10 @@ func NewRoundTime(
 	roundDuration := time.Duration(config.RoundLength) * time.Second
 	c := time.Duration(config.ConfirmPhase) * time.Millisecond
 	t := RoundTime{
-		Confirm:   c / 2,
-		Intent:    c - (c / 2),
-		Broadcast: roundDuration - c,
+		RoundLength: roundDuration,
+		Confirm:     c / 2,
+		Intent:      c - (c / 2),
+		Broadcast:   roundDuration - c,
 	}
 
 	for _, o := range opts {
@@ -43,16 +43,11 @@ func NewRoundTime(
 	return t
 }
 
-// StartIntent creates and starts the ticker. time.Timer's are a bit tricky. Be very
-// careful to StopTicker correctly if you want call this more than once.
-func (t *RoundTime) StartIntent() {
-	t.Ticker = time.NewTimer(t.Intent)
-}
-func (t *RoundTime) StartConfirm() {
-	t.Ticker = time.NewTimer(t.Confirm)
-}
-func (t *RoundTime) StartBroadcast() {
-	t.Ticker = time.NewTimer(t.Broadcast)
+func (t *RoundTime) Start(offset time.Duration) {
+	// XXX: TODO possibly panic would be safer than modulo here, as offset > rl
+	// indicates we got the expected round calc wrong.
+	untilNextRound := t.RoundLength - (offset % t.RoundLength)
+	t.Ticker = time.NewTimer(untilNextRound)
 }
 
 // Stop stops and, if necessary, drains the ticker

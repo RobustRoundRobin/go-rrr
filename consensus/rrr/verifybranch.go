@@ -159,30 +159,16 @@ func (r *EndorsmentProtocol) VerifyHeader(chain headerByHashChainReader, header 
 			se.Intent.ChainID.Hex(), r.genesisEx.ChainID.Hex())
 	}
 
-	switch r.config.RoundAgreement {
-	case RoundAgreementNTP:
+	// This is just telemetry for interest, its not part of validation
+	intentTime := r.genesisSealTime.Add(
+		time.Duration(se.Intent.RoundNumber.Uint64()*r.config.RoundLength) * time.Second)
 
-		// This is just telemetry for interest, its not part of validation
-		intentTime := r.genesisSealTime.Add(
-			time.Duration(se.Intent.RoundNumber.Uint64()*r.config.RoundLength) * time.Second)
-
-		sealTime := time.Time{}
-		err := sealTime.UnmarshalBinary(se.SealTime)
-		if err != nil {
-			return se, err
-		}
+	sealTime := time.Time{}
+	if err = sealTime.UnmarshalBinary(se.SealTime); err == nil {
 		r.logger.Debug("RRR VerifyHeader - intent vs seal time", "d", sealTime.Sub(intentTime))
-
-	case RoundAgreementBlockClock:
-		fallthrough
-	default:
-		// Check that the round in the intent matches the block number
-		if se.Intent.RoundNumber.Cmp(bigBlockNumber) != 0 {
-			return se, fmt.Errorf(
-				"rrr sealed intent invalid intent round number: %v != block number: %v",
-				se.Intent.RoundNumber, bigBlockNumber)
-		}
+		return se, err
 	}
+	// End telemetry
 
 	// Ensure that the coinbase is valid
 	if header.GetNonce() != emptyNonce {
