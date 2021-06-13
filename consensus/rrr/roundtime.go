@@ -57,6 +57,11 @@ func (t *RoundTime) Stop() {
 	}
 }
 
+// Reset resets for an arbitrary duration
+func (t *RoundTime) Reset(d time.Duration) {
+	t.Ticker.Reset(d)
+}
+
 // ResetForIntentPhase resets the ticker appropriately for begining the intent
 // phase (without adjustment). Be very careful to call StopTicker exactly once
 // before calling this.

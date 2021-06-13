@@ -137,6 +137,11 @@ type EndorsmentProtocol struct {
 	pendingEnrolments   map[Hash]*EnrolmentBinding
 
 	a ActiveSelection
+
+	// ne worth of indices into the active selection. resampled by
+	// setRoundFromTime. SelectCandidatesAndEndorsers is always passed the
+	// current slice
+	activeSample []int
 }
 
 // NewRoundState creates and initialises a RoundState
@@ -159,6 +164,7 @@ func NewRoundState(
 
 		chainHeadRound: new(big.Int),
 		Number:         new(big.Int),
+		activeSample:   make([]int, config.Endorsers),
 	}
 
 	if logger != nil {

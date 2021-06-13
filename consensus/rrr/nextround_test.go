@@ -92,7 +92,7 @@ func TestAlignFailedAttempts(t *testing.T) {
 		fexpect      uint32
 	}{
 		{
-			"perfect start - 5 second round",
+			"perfect start",
 			now, now,
 			0, // rh (headRound)
 			0, // fcarry

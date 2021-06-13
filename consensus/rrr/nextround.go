@@ -7,10 +7,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/big"
 	"math/rand"
 	"sort"
 	"time"
+)
+
+var (
+	ErrFutureBlock = errors.New("the time on the head block is in the future with respect to the reference value")
 )
 
 func (r *EndorsmentProtocol) SetState(state RoundState) RoundState {
@@ -151,44 +154,50 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 
 		// XXX: TODO if we need to do a phase adjustment to aligh with 'now',
 		// doing it here lets us use the broadcast phase as an absorber. A
-		// particular case we care about is the leap second case. But its not
-		// straight forward to do that robustly
+		// particular case we care about is the leap second case.
 		r.T.ResetForBroadcastPhase()
 		r.Phase = RoundPhaseBroadcast
 
 	case RoundPhaseBroadcast:
 
-		// Was the round successful ? do we have the block from the completed
-		// round now ?
-
 		now := time.Now()
-		rh := r.chainHeadRound.Int64()
+		offset := r.setRoundForTime(now)
 
-		f := r.alignFailedAttempts(now, rh, r.FailedAttempts)
+		// The following factors make it worth dealing with the offset here:
+		// 1. The timers are absoloute (monotonic) time so leaps will throw the
+		// phase out of whack with respec to the wall clock, as will vanila
+		// inaccuracies due to os variasions and load.
+		// 2. geth stops the consensus engine while it is synching blocks and
+		// restarts at arbirary times (Though we try to account for that in
+		// StartRound)
 
-		if f > r.FailedAttempts {
+		// Note: config.Confirm is currently split evenly between intent & confirm in RoundTime
+		endIntent := (time.Duration(r.config.ConfirmPhase) * time.Millisecond) / 2
+		endConfirm := time.Duration(r.config.ConfirmPhase) * time.Millisecond
+		endBroadcast := time.Duration(r.config.RoundLength) * time.Second
 
-			var chainHeadRound *big.Int
-			if r.chainHeadExtra != nil {
-				chainHeadRound = r.chainHeadExtra.Intent.RoundNumber
-			}
-
-			r.logger.Info(
-				"RRR PhaseTick - round failed to produce block",
-				"chr", chainHeadRound, "r", r.Number, "f", f)
+		switch {
+		case offset < endIntent:
+			r.Phase = RoundPhaseIntent
+			r.T.Reset(endIntent - offset)
+			// This commits to the round states for all nodes candidate, endorser,
+			// none. incomming intents are invalid (and ignored) if the source
+			// identity is not selected as a confirmer here. A NewChainHead can
+			// happen at any time, and it will update the DRGB and so on imediately,
+			// but that won't disturb the selections made here.
+			r.electAndPropose(b)
+		case offset < endConfirm:
+			r.Phase = RoundPhaseConfirm
+			r.T.Reset(endConfirm - offset)
+			r.logger.Debug("RRR PhaseTick - skipped intent phase (catchup)", "r", r.Number, "o", offset)
+		case offset <= endBroadcast:
+			r.Phase = RoundPhaseBroadcast
+			r.T.Reset(endBroadcast - offset)
+			r.logger.Debug("RRR PhaseTick - skipped intent & confirm phase (catchup)", "r", r.Number, "o", offset)
+		default:
+			r.logger.Warn("RRR PhaseTick - round offset to large", "offset", offset)
 		}
 
-		r.setRoundFromAttempts(f)
-
-		r.Phase = RoundPhaseIntent
-		r.T.ResetForIntentPhase()
-
-		// This commits to the round states for all nodes candidate, endorser,
-		// none. incomming intents are invalid (and ignored) if the source
-		// identity is not selected as a confirmer here. A NewChainHead can
-		// happen at any time, and it will update the DRGB and so on imediately,
-		// but that won't disturb the selections made here.
-		r.electAndPropose(b)
 	default:
 		panic("TODO - recovery")
 	}
@@ -287,15 +296,14 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 
 	r.signedIntent = nil
 
-	permutation := r.nextActivePermutation()
 	r.logger.Info(
-		"RRR PERMUTATION >>>>>>>>>>>", "r", r.Number, "f", r.FailedAttempts, "p", permutation)
+		"RRR ACTIVE SAMPLE >>>>>>>>>", "s", r.activeSample, "r", r.Number, "f", r.FailedAttempts)
 
-	sort.Ints(permutation) // selection requires this to be sort ascending
+	sort.Ints(r.activeSample)
 
 	// If we are a leader candidate we need to broadcast an intent.
 	r.candidates, r.endorsers, r.selection, err = r.a.SelectCandidatesAndEndorsers(
-		permutation,
+		r.activeSample,
 		uint32(r.config.Candidates), uint32(r.config.Endorsers), uint32(r.config.Quorum),
 		uint32(r.config.Activity),
 		r.FailedAttempts)
@@ -335,35 +343,60 @@ func (r *EndorsmentProtocol) updateStableSeed(
 		return err
 	}
 	r.Rand = randFromSeed(roundSeed)
-
-	rh := r.chainHeadRound.Int64()
-	f := r.alignFailedAttempts(now, rh, 0) // zero because we just set the seed
-
-	// If blocks arrive outside of the broadcast phase we just have to cope (in
-	// handleIntent and so on)
-	r.setRoundFromAttempts(f)
+	r.FailedAttempts = 0 // because we just set the seed
+	r.setRoundForTime(now)
 
 	return nil
 }
 
-func (r *EndorsmentProtocol) setRoundFromAttempts(f uint32) {
+// setRoundForTime sets the round and the number and aligns the DRGB state and
+// returns the duration offset into the current round. If the time sealed on the
+// chainHead is ahead of now f is set to 0. And a log is emited.
+func (r *EndorsmentProtocol) setRoundForTime(now time.Time) time.Duration {
 
-	r.FailedAttempts = f
 	rh := r.chainHeadRound.Int64()
+
+	// f is the number of rounds since block produced by round rh according to
+	// (now - thead) / rl
+	r.FailedAttempts = r.alignFailedAttempts(now, rh, r.FailedAttempts)
+
 	// test & set so we can log round changes triggered by NewChainHead
-	round := rh + int64(f)
+	round := rh + int64(r.FailedAttempts)
 	if r.Number.Int64() != round {
 		r.logger.Info(
-			"RRR setFromAttempts - round change",
-			"rh", rh, "cur", r.Number, "new", round, "f", f)
+			"RRR setRoundForTime - round change",
+			"rh", rh, "cur", r.Number, "new", round, "f", r.FailedAttempts)
 		r.Number.SetInt64(round)
 	}
+
+	// Calculate the expected start time for the current round and return the
+	// duration offset to now.
+
+	// This is robust in the face of leap seconds. The round is calculated from
+	// the wall clock time, so eR will include the effect of leaps. We start
+	// from the chain head rather than genesis because durations are nanos and
+	// thats only a few hundred years.
+	eR := r.chainHeadSealTime.Add(
+		time.Duration(r.FailedAttempts) * time.Duration(r.config.RoundLength) * time.Second)
+
+	return now.Sub(eR)
 }
 
-// https://go.googlesource.com/proposal/+/master/design/12914-monotonic.md
+// alignFailedAttempts samples the DRGB once for each new failed attempt.  Ie,
+// `f - fprevious` times. fprevious should be the last return value from this
+// function or 0 if the seed has just been initialised from a new block. f is
+// calculated by this function as now / roundLength. leap seconds are
+// effectively ignored. As they accumulate they will eventually result in a
+// skipped round - which is just a single additional failed attempt. Note that
+// the base time comes from marshaled binary time which omits the monotonic
+// clock (as they are not meaningfull accross process boundaries). So the call
+// to time.Sub in this function uses wall clock time. Refs for time in go:
+// 	https://golang.org/pkg/time/#hdr-Monotonic_Clocks
+// 	https://go.googlesource.com/proposal/+/master/design/12914-monotonic.md
 func (r *EndorsmentProtocol) alignFailedAttempts(
-	now time.Time, rh int64, fcarry uint32, // from current round (or zero if NewChainHead)
+	now time.Time, rh int64, fprevious uint32, // from current round (or zero if NewChainHead)
 ) uint32 {
+
 	// failedAttempts since the last known round (or genesis seal) is given as:
 	//
 	// 	f = [ now - T(rh) ] / rl
@@ -376,16 +409,29 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 	rl := time.Duration(r.config.RoundLength) * time.Second
 	// 	f = [ now - T(rh) ] / rl
 
+	// This subtraction will use wall clock time as seal time came from a
+	// MarshalBinary time - which omits monotonic. We could do now =
+	// now.Round(0) but it isn't necessary.
 	d := now.Sub(r.chainHeadSealTime)
-	// plausibly re-orgs and local clock issues can give us blocks from the future.
+
+	// is the current chain head from the future ?
 	if d < 0 {
-		r.logger.Info("RRR calcFailedAttempts - future block ?", "d", d, "trh", r.chainHeadSealTime)
-		d = time.Duration(0)
+		r.logger.Info("RRR alignFailedAttempts - future block ?", "d", d, "now", now, "th", r.chainHeadSealTime)
+		return 0
 	}
 
 	f := uint32(d / rl)
 
-	r.logger.Info("RRR alignFailedAttempts", "carry", fcarry, "f", f, "delta", f-fcarry)
+	r.logger.Debug("RRR alignFailedAttempts", "f", f, "fprevious", fprevious, "delta", f-fprevious)
+	if f < fprevious {
+		r.logger.Info("RRR alignFailedAttempts - f < fprevious", "f", f, "fprevious", fprevious, "delta", fprevious-f)
+		return f
+	}
+
+	if f == fprevious {
+		r.logger.Info("RRR alignFailedAttempts - f = fprevious", "f", f)
+		return f
+	}
 
 	if r.a.NumActive() <= int(r.config.Endorsers) {
 		r.logger.Info(
@@ -393,36 +439,36 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 			"na", r.a.NumActive())
 		return f
 	}
+
 	perms := ""
 	var i uint32
-	for i = fcarry; i < f; i++ {
-		p := r.nextActivePermutation()
-		perms = perms + fmt.Sprintf("%v", p)
+	for i = fprevious; i < f; i++ {
+		r.activeSample = r.nextActiveSample(r.activeSample)
+		perms = perms + fmt.Sprintf("%v", r.activeSample)
 	}
-	r.logger.Info(
-		"RRR PERMUTATION ...........", "na",
-		r.a.NumActive(), "r", r.Number, "f", r.FailedAttempts, "p", perms)
+	r.logger.Debug(
+		"RRR DRGB CATCHUP  ...........", "p", perms, "na",
+		r.a.NumActive(), "r", r.Number, "f", r.FailedAttempts)
 
-	return fcarry + i
+	return f
 }
 
-// nextActivePermutation returns a random permutation of indices into nActive.
-// The permutation is ne (n endorsers) long. It is sample without replacement.
-// This is contrary to the paper because replacement causes issues for small
-// networks in the case where endorsers are selected more than once by the same
-// permutation.
-func (r *EndorsmentProtocol) nextActivePermutation() []int {
+// nextActiveSample returns a random permutation of indices into nActive.
+// The permutation should be ne (n endorsers) elements long. It is sample without
+// replacement.  This is contrary to the paper because replacement causes issues
+// for small networks in the case where endorsers are selected more than once by
+// the same permutation.
+func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 
 	// DIVERGENCE (5) we do sample *without* replacement because replacement
 	// predjudices the quorum in small networks (and network initialisation)
 
-	nsamples := int(r.config.Endorsers)
+	nsamples := len(s)
 	nactive := r.a.NumActive()
 
 	// This will force select them all active identities when na <= ns. na=0
 	// is not special.
 	if nactive <= nsamples {
-		s := make([]int, nsamples)
 		for i := 0; i < nsamples; i++ {
 			s[i] = i
 		}
@@ -434,8 +480,6 @@ func (r *EndorsmentProtocol) nextActivePermutation() []int {
 	// For now we define na < nsamples * 2 as 'close', but that was pretty
 	// arbitrary.
 	if nactive < nsamples*2 {
-
-		s := make([]int, nactive)
 
 		for i := 0; i < len(s); i++ {
 			s[i] = i
@@ -452,7 +496,6 @@ func (r *EndorsmentProtocol) nextActivePermutation() []int {
 	}
 
 	indices := map[int]bool{}
-	s := make([]int, nsamples)
 	for i := 0; i < nsamples; i++ {
 		var rv int
 		for {
