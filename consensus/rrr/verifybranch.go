@@ -159,13 +159,14 @@ func (r *EndorsmentProtocol) VerifyHeader(chain headerByHashChainReader, header 
 			se.Intent.ChainID.Hex(), r.genesisEx.ChainID.Hex())
 	}
 
-	// This is just telemetry for interest, its not part of validation
-	intentTime := r.genesisSealTime.Add(
-		time.Duration(se.Intent.RoundNumber.Uint64()*r.config.RoundLength) * time.Second)
+	// This is just telemetry for interest, its not part of validation.
+	// Endorsers are responsible for rejecting intents for invalid rounds.
+	intentTime := r.genesisRoundStart.Add(
+		r.roundLength * time.Duration(se.Intent.RoundNumber))
 
 	sealTime := time.Time{}
 	if err = sealTime.UnmarshalBinary(se.SealTime); err == nil {
-		r.logger.Debug("RRR VerifyHeader - intent vs seal time", "d", sealTime.Sub(intentTime))
+		r.logger.Debug("RRR VerifyHeader - intent round start vs seal time", "d", sealTime.Sub(intentTime))
 		return se, err
 	}
 	// End telemetry

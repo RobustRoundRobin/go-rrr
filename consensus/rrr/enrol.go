@@ -5,7 +5,6 @@ package rrr
 import (
 	"crypto/ecdsa"
 	"fmt"
-	"math/big"
 )
 
 // Quote is the 'pseudo' attestation of identity performed using node private
@@ -56,7 +55,7 @@ func (codec *CipherCodec) FillEnrolmentQuote(q []byte, u Hash, a *ecdsa.PrivateK
 // chainID. Round is the current round of consensus. blockHash identifies the
 // current head of the chain (selected branch)
 func (codec *CipherCodec) SignEnrolmentBindingHash(
-	q *Quote, key *ecdsa.PrivateKey, chainID Hash, nodeid Hash, round *big.Int,
+	q *Quote, key *ecdsa.PrivateKey, chainID Hash, nodeid Hash, round uint64,
 	blockHash Hash, reEnrol bool,
 ) error {
 	e := &EnrolmentBinding{
@@ -71,11 +70,11 @@ func (codec *CipherCodec) SignEnrolmentBindingHash(
 // EnrolmentBinding is rlp encoded, hashed and signed to introduce NodeID as a
 // member.
 type EnrolmentBinding struct {
-	ChainID   Hash     // ChainID is EIP-rrr/extraData of Block0
-	NodeID    Hash     // NodeID is defined by ethereum as keccak 256 ( PublicKey X || Y )
-	Round     *big.Int // Round is the consensus round
-	BlockHash Hash     // BlockHash is the block hash for the head of the selected chain branch
-	ReEnrol   bool     // true if the identity has been enroled before.
+	ChainID   Hash   // ChainID is EIP-rrr/extraData of Block0
+	NodeID    Hash   // NodeID is defined by ethereum as keccak 256 ( PublicKey X || Y )
+	Round     uint64 // Round is the consensus round
+	BlockHash Hash   // BlockHash is the block hash for the head of the selected chain branch
+	ReEnrol   bool   // true if the identity has been enroled before.
 }
 
 // U encodes the userdata hash to sign for the enrolment.

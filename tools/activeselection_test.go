@@ -459,7 +459,7 @@ func (net *network) sealBlock(
 		net.t, key, makeTimeStamp(net.t, 0, 0), intent, confirm, dummySeed)
 
 	return makeBlockHeader(
-		withNumber(intent.RoundNumber.Int64()),
+		withNumber(int64(intent.RoundNumber)),
 		withParent(common.Hash(intent.ParentHash)),
 		withSeal(data))
 }
@@ -480,7 +480,7 @@ func requireMakeSignedExtraData(
 			Confirm: make([]rrr.Endorsement, len(confirm)),
 		},
 	}
-	data.Intent.RoundNumber = big.NewInt(0).Set(intent.RoundNumber)
+	data.Intent.RoundNumber = intent.RoundNumber
 	if seed != nil {
 		copy(data.Seed, seed)
 	}
@@ -527,8 +527,7 @@ func fillIntent(
 
 	i.ChainID = chainID
 	i.NodeID = rrr.NodeIDFromPub(c, &proposer.PublicKey)
-	i.RoundNumber = big.NewInt(0).Set(roundNumber)
-	i.FailedAttempts = failedAttempts
+	i.RoundNumber = roundNumber.Uint64()
 	i.ParentHash = rrr.Hash(parent.Hash())
 	i.TxHash = rrr.Hash(parent.GetTxHash())
 	return i

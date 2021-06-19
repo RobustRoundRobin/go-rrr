@@ -24,8 +24,14 @@ const (
 	RRRExtraVanity = 32
 )
 
+var (
+	big0 = new(big.Int).SetInt64(0)
+)
+
 type BlockHeader struct {
 	types.Header
+	se        *rrr.SignedExtraData `rlp:"-"`
+	signerPub []byte               `rlp:"-"`
 }
 
 func NewBlockHeader(h *types.Header) rrr.BlockHeader {
@@ -90,6 +96,25 @@ func (h *BlockHeader) GetTime() uint64 {
 
 func (h *BlockHeader) GetSeal() []byte {
 	return h.Extra[RRRExtraVanity:]
+}
+
+// GetRound returns the RRR consensus round the block was produced on.
+func (h *BlockHeader) GetRound(decoder rrr.SignedExtraDecoder) (uint64, error) {
+
+	if h.Number.Cmp(big0) == 0 {
+		return 0, nil
+	}
+
+	// do the seal decode lazily
+	if h.se == nil {
+		var err error
+		h.se = &rrr.SignedExtraData{}
+		h.signerPub, err = decoder.DecodeSignedExtraData(h.se, h.GetSeal())
+		if err != nil {
+			return 0, err
+		}
+	}
+	return h.se.Intent.RoundNumber, nil
 }
 
 func (h *BlockHeader) GetNonce() [8]byte {

@@ -18,13 +18,13 @@ const (
 )
 
 var (
-	ErrRoundAgreementInvalid   = errors.New("'blockclock' or 'ntp' are the only supported methods")
-	ErrConfirmPhaseToLarge     = errors.New("confirm phase can not be longer than the round")
-	ErrIncompatibleChainReader = errors.New("chainreader missing required interfaces for RRR")
-	ErrNoGenesisHeader         = errors.New("failed to get genesis header")
-	ErrNotLeaderCandidate      = errors.New("expected to be leader candidate")
-	ErrEngineStopped           = errors.New("consensus not running")
-	ErrRMsgInvalidCode         = errors.New("recevived RMsg with invalid code")
+	ErrRoundAgreementInvalid        = errors.New("'blockclock' or 'ntp' are the only supported methods")
+	ErrIntentAndConfirmPhaseToLarge = errors.New("intent + confirm phase can not be longer than the round")
+	ErrIncompatibleChainReader      = errors.New("chainreader missing required interfaces for RRR")
+	ErrNoGenesisHeader              = errors.New("failed to get genesis header")
+	ErrNotLeaderCandidate           = errors.New("expected to be leader candidate")
+	ErrEngineStopped                = errors.New("consensus not running")
+	ErrRMsgInvalidCode              = errors.New("recevived RMsg with invalid code")
 
 	// Difficulty is the measure of 'how hard' it is to extend the chain. For
 	// PoA, and RRR in particular, this is just an indicator of whose turn it
@@ -160,8 +160,10 @@ func NewEngine(
 	config *Config, codec *CipherCodec,
 	privateKey *ecdsa.PrivateKey, logger Logger, opts ...EngineOption) (*Engine, error) {
 
-	if config.ConfirmPhase > config.RoundLength*1000 {
-		return nil, fmt.Errorf("confirm=%v, round=%v: %w", config.ConfirmPhase, config.RoundLength, ErrConfirmPhaseToLarge)
+	if (config.IntentPhase + config.ConfirmPhase) >= config.RoundLength {
+		return nil, fmt.Errorf(
+			"i=%v, c=%v, round=%v: %w",
+			config.IntentPhase, config.ConfirmPhase, config.RoundLength, ErrIntentAndConfirmPhaseToLarge)
 	}
 
 	switch config.RoundAgreement {

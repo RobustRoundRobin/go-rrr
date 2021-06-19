@@ -85,13 +85,21 @@ type EndorsmentProtocol struct {
 	codec *CipherCodec
 
 	// Node and chain context
-	config          *Config
+	config *Config
+	// We use this so often we just pre-compute once, mostly for clarity,
+	// = time.Duration(config.RoundLength) * time.Milliseconds
+	roundLength     time.Duration
 	genesisEx       GenesisExtraData
 	genesisSealTime time.Time
-	privateKey      *ecdsa.PrivateKey
-	nodeID          Hash // derived from privateKey
 
-	nodeAddr Address
+	// gensisRoundStart is The effective start time of the genesis round.
+	// genesisSealTime.Truncate(roundLength)
+	genesisRoundStart time.Time
+
+	// Node identity
+	privateKey *ecdsa.PrivateKey
+	nodeID     Hash // derived from privateKey
+	nodeAddr   Address
 
 	vrf ecvrf.VRF
 	T   RoundTime
@@ -101,8 +109,13 @@ type EndorsmentProtocol struct {
 	chainHead            BlockHeader
 	chainHeadExtraHeader *ExtraHeader     // genesis & consensus blocks
 	chainHeadExtra       *SignedExtraData // consensus blocks only
-	chainHeadRound       *big.Int
-	chainHeadSealTime    time.Time
+
+	// For this consensus, round length is multiple seconds. An int64 is more
+	// than big enough.
+	chainHeadRound      uint64
+	chainHeadSealTime   time.Time
+	chainHeadRoundStart time.Time
+	// chainHeadRoundStart  time.Time
 
 	Phase RoundPhase
 
@@ -113,7 +126,7 @@ type EndorsmentProtocol struct {
 	// but it must hold the lock to update it.
 	state RoundState
 
-	Number         *big.Int
+	Number         uint64
 	FailedAttempts uint32
 
 	OnlineEndorsers map[Address]Peer
@@ -162,9 +175,8 @@ func NewRoundState(
 
 		pendingEnrolments: make(map[Hash]*EnrolmentBinding),
 
-		chainHeadRound: new(big.Int),
-		Number:         new(big.Int),
-		activeSample:   make([]int, config.Endorsers),
+		roundLength:  time.Duration(config.RoundLength) * time.Millisecond,
+		activeSample: make([]int, config.Endorsers),
 	}
 
 	if logger != nil {
@@ -212,6 +224,7 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 			r.logger.Debug("RRR CheckGenesis - unmarshal seal time", "err", err)
 			return err
 		}
+		r.genesisRoundStart = r.genesisSealTime.Truncate(r.roundLength)
 	}
 	r.logger.Trace("RRR CheckGenesis", "chainid", r.genesisEx.ChainID.Hex())
 	if err := r.checkGenesisExtra(&r.genesisEx); err != nil {
@@ -238,7 +251,7 @@ func (r *EndorsmentProtocol) StableSeed(chain EngineChainReader, headNumber uint
 		return 0, 0, fmt.Errorf("failed decoding stable header seal: %v", err)
 	}
 	seed, err := ConditionSeed(se.Seed)
-	return seed, se.Intent.RoundNumber.Uint64(), err
+	return seed, se.Intent.RoundNumber, err
 }
 
 // PrimeActiveSelection should be called for engine Start
@@ -274,7 +287,7 @@ func (r *EndorsmentProtocol) QueueEnrolment(et *EngEnrolIdentity) error {
 		// Round will be updated when we are ready to submit the enrolment. We
 		// record it here so we can keep track of how long enrolments have been
 		// queued.
-		Round: big.NewInt(0).Set(r.Number),
+		Round: r.Number,
 		// Block hash filled in when we issue the intent containing this
 		// enrolment.
 
@@ -307,7 +320,7 @@ func (r *EndorsmentProtocol) NewSignedIntent(et *EngSignedIntent) {
 	}
 
 	r.logger.Trace("RRR run got engSignedIntent",
-		"round", r.Number, "cand-round", et.RoundNumber, "cand-attempts", et.FailedAttempts,
+		"round", r.Number, "cand-round", et.RoundNumber,
 		"candidate", et.NodeID.Hex(), "parent", et.ParentHash.Hex())
 
 	if err := r.handleIntent(et); err != nil {
@@ -372,21 +385,23 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	}
 
 	// Check that the intent round matches our current round.
-	if r.Number.Cmp(et.RoundNumber) != 0 {
+	if r.Number != et.RoundNumber {
 		r.logger.Info("RRR handleIntent - wrong round",
 			"r", r.Number, "ir", et.RoundNumber, "from-addr", intenderAddr.Hex())
 		return nil
 	}
 
+	// Number of rounds that did not produce a block (failedAttempts).
+	f := uint32(et.RoundNumber - r.chainHeadRound)
+
 	// Check that the intent comes from a node we have selected locally as a
-	// leader candidate. According to the (matching) roundNumber and their
-	// provided value for FailedAttempts
+	// leader candidate. According to the (matching) roundNumber
 	if !r.a.LeaderForRoundAttempt(
 		uint32(r.config.Candidates), uint32(r.config.Endorsers),
-		intenderAddr, et.Intent.FailedAttempts) {
+		intenderAddr, f) {
 		r.logger.Info(
 			"RRR handleIntent - intent from non-candidate",
-			"round", r.Number, "cand-f", et.Intent.FailedAttempts, "cand", intenderAddr.Hex())
+			"round", r.Number, "f", f, "cand", intenderAddr.Hex())
 		return ErrNotLeaderCandidate
 	}
 
@@ -401,7 +416,7 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 			// current is older
 			r.logger.Trace(
 				"RRR handleIntent - ignoring intent from younger candidate",
-				"cand-addr", intenderAddr.Hex(), "cand-f", et.Intent.FailedAttempts)
+				"cand-addr", intenderAddr.Hex(), "f", f)
 			return nil
 		}
 	}

@@ -42,13 +42,11 @@ func (r *EndorsmentProtocol) StartRounds(b Broadcaster, chain EngineChainReader)
 	// mining its uncertain.
 	r.newChainHead(now, b, chain, head)
 
-	rl := time.Duration(r.config.RoundLength) * time.Second
-
 	// T(eR) Get the expected start time for the expected round eR
-	teR := r.chainHeadSealTime.Add(time.Duration(int64(r.FailedAttempts)) * rl)
+	eR := r.chainHeadRoundStart.Add(time.Duration(int64(r.FailedAttempts)) * r.roundLength)
 
 	// ro = now - T(eR) = offset into expected round
-	ro := now.Sub(teR)
+	ro := now.Sub(eR)
 	if ro < 0 {
 		r.logger.Info("RRR alignRoundState - future block", "ro", ro)
 		ro = time.Duration(0)
@@ -161,7 +159,7 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 	case RoundPhaseBroadcast:
 
 		now := time.Now()
-		offset := r.setRoundForTime(now)
+		offset, roundAdvanced := r.setRoundForTime(now)
 
 		// The following factors make it worth dealing with the offset here:
 		// 1. The timers are absoloute (monotonic) time so leaps will throw the
@@ -171,15 +169,12 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 		// restarts at arbirary times (Though we try to account for that in
 		// StartRound)
 
-		// Note: config.Confirm is currently split evenly between intent & confirm in RoundTime
-		endIntent := (time.Duration(r.config.ConfirmPhase) * time.Millisecond) / 2
-		endConfirm := time.Duration(r.config.ConfirmPhase) * time.Millisecond
-		endBroadcast := time.Duration(r.config.RoundLength) * time.Second
-
+		endConfirm := r.T.Intent + r.T.Confirm
+		endRound := endConfirm + r.T.Broadcast
 		switch {
-		case offset < endIntent:
+		case offset < r.T.Intent:
 			r.Phase = RoundPhaseIntent
-			r.T.Reset(endIntent - offset)
+			r.T.Reset(r.T.Intent - offset)
 			// This commits to the round states for all nodes candidate, endorser,
 			// none. incomming intents are invalid (and ignored) if the source
 			// identity is not selected as a confirmer here. A NewChainHead can
@@ -189,13 +184,26 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 		case offset < endConfirm:
 			r.Phase = RoundPhaseConfirm
 			r.T.Reset(endConfirm - offset)
-			r.logger.Debug("RRR PhaseTick - skipped intent phase (catchup)", "r", r.Number, "o", offset)
-		case offset <= endBroadcast:
+			r.logger.Debug(
+				"RRR PhaseTick - skipped intent phase (catchup)",
+				"r", r.Number, "o", offset, "advanced", roundAdvanced)
+		case offset <= endRound:
 			r.Phase = RoundPhaseBroadcast
-			r.T.Reset(endBroadcast - offset)
-			r.logger.Debug("RRR PhaseTick - skipped intent & confirm phase (catchup)", "r", r.Number, "o", offset)
+			r.T.Reset(endRound - offset)
+			if roundAdvanced {
+
+				r.logger.Debug(
+					"RRR PhaseTick - delaying intent phase by (slow round)",
+					"r", r.Number, "d", endRound-offset)
+
+			} else {
+				r.logger.Debug(
+					"RRR PhaseTick - delaying intent phase (fast round)",
+					"r", r.Number, "d", endRound-offset)
+
+			}
 		default:
-			r.logger.Warn("RRR PhaseTick - round offset to large", "offset", offset)
+			r.logger.Warn("RRR PhaseTick - round offset to large", "offset", offset, "advanced", roundAdvanced)
 		}
 
 	default:
@@ -233,6 +241,7 @@ func (r *EndorsmentProtocol) setChainHead(chain EngineChainReader, head BlockHea
 
 		r.chainHeadExtraHeader = &r.chainHeadExtra.ExtraHeader
 
+		// head seal time is only used for telemetry
 		err = r.chainHeadSealTime.UnmarshalBinary(r.chainHeadExtraHeader.SealTime)
 		if err != nil {
 			return err
@@ -240,13 +249,17 @@ func (r *EndorsmentProtocol) setChainHead(chain EngineChainReader, head BlockHea
 	}
 
 	// Establish the round of the chain head. The genesis block is round 0.
-	r.chainHeadRound.SetUint64(0)
+	r.chainHeadRound = uint64(0)
 
 	if r.chainHeadExtra != nil { //  nil for genesis round R1
 		// For blockclock the intent roundnumber is the block number
 		// (checked by VerifyHeader)
-		r.chainHeadRound.Set(r.chainHeadExtra.Intent.RoundNumber)
+		r.chainHeadRound = r.chainHeadExtra.Intent.RoundNumber
 	}
+
+	// round number will include the effect of leap seconds
+	r.chainHeadRoundStart = r.genesisRoundStart.Add(
+		time.Duration(r.chainHeadRound) * r.roundLength)
 
 	return nil
 }
@@ -350,54 +363,59 @@ func (r *EndorsmentProtocol) updateStableSeed(
 }
 
 // setRoundForTime sets the round and the number and aligns the DRGB state and
-// returns the duration offset into the current round. If the time sealed on the
-// chainHead is ahead of now f is set to 0. And a log is emited.
-func (r *EndorsmentProtocol) setRoundForTime(now time.Time) time.Duration {
+// returns the duration offset into the current round and a boolean indicating
+// if the round has advanced. If the time sealed on the chainHead is ahead of
+// now f is set to 0. And a log is emited.
+func (r *EndorsmentProtocol) setRoundForTime(now time.Time) (time.Duration, bool) {
 
-	rh := r.chainHeadRound.Int64()
+	rh := r.chainHeadRound
+
+	newRound := false
 
 	// f is the number of rounds since block produced by round rh according to
 	// (now - thead) / rl
 	r.FailedAttempts = r.alignFailedAttempts(now, rh, r.FailedAttempts)
 
-	// test & set so we can log round changes triggered by NewChainHead
-	round := rh + int64(r.FailedAttempts)
-	if r.Number.Int64() != round {
+	round := rh + uint64(r.FailedAttempts)
+	if r.Number != round {
+
+		newRound = true
+
 		r.logger.Info(
 			"RRR setRoundForTime - round change",
-			"rh", rh, "cur", r.Number, "new", round, "f", r.FailedAttempts)
-		r.Number.SetInt64(round)
+			"rh", rh, "cur", r.Number, "new", round)
+		r.Number = round
 	}
 
 	// Calculate the expected start time for the current round and return the
 	// duration offset to now.
 
 	// This is robust in the face of leap seconds. The round is calculated from
-	// the wall clock time, so eR will include the effect of leaps. We start
-	// from the chain head rather than genesis because durations are nanos and
-	// thats only a few hundred years.
-	eR := r.chainHeadSealTime.Add(
-		time.Duration(r.FailedAttempts) * time.Duration(r.config.RoundLength) * time.Second)
+	// the wall clock time, so eR will include the effect of leaps.
 
-	return now.Sub(eR)
+	eR := r.genesisRoundStart.Add(time.Duration(rh+uint64(r.FailedAttempts)) * r.roundLength)
+
+	return now.Sub(eR), newRound
 }
 
 // alignFailedAttempts samples the DRGB once for each new failed attempt.  Ie,
 // `f - fprevious` times. fprevious should be the last return value from this
 // function or 0 if the seed has just been initialised from a new block. f is
-// calculated by this function as now / roundLength. leap seconds are
+// calculated by this function as (now - rh) / roundLength. rh is the start time
+// of the round that produced the current head block. leap seconds are
 // effectively ignored. As they accumulate they will eventually result in a
-// skipped round - which is just a single additional failed attempt. Note that
+// skipped round - which is just a single additional failed attempt.  Note that
 // the base time comes from marshaled binary time which omits the monotonic
 // clock (as they are not meaningfull accross process boundaries). So the call
-// to time.Sub in this function uses wall clock time. Refs for time in go:
+// to time.Sub in this function uses wall clock time. Refs for time in
+// go:
 // 	https://golang.org/pkg/time/#hdr-Monotonic_Clocks
 // 	https://go.googlesource.com/proposal/+/master/design/12914-monotonic.md
 func (r *EndorsmentProtocol) alignFailedAttempts(
-	now time.Time, rh int64, fprevious uint32, // from current round (or zero if NewChainHead)
+	now time.Time, rh uint64, fprevious uint32, // from current round (or zero if NewChainHead)
 ) uint32 {
 
-	// failedAttempts since the last known round (or genesis seal) is given as:
+	// failedAttempts since the round that produced the chain heaad is given as:
 	//
 	// 	f = [ now - T(rh) ] / rl
 	//
@@ -405,37 +423,41 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 	// round, the block is sealed and broadcast at the end of the confirm phase
 	// and arrives *before* the end of the round. This will result in f=0 and R
 	// will be the current round.
+	//
+	// For initialisation, before the first block is produced,
+	// chainHeadRoundStart is the timestamp sealed on the genesis block tuncated
+	// (rounded down) to the nearest multiple of roundLength.
 
-	rl := time.Duration(r.config.RoundLength) * time.Second
+	rl := r.roundLength
 	// 	f = [ now - T(rh) ] / rl
 
 	// This subtraction will use wall clock time as seal time came from a
 	// MarshalBinary time - which omits monotonic. We could do now =
 	// now.Round(0) but it isn't necessary.
-	d := now.Sub(r.chainHeadSealTime)
+	d := now.Sub(r.chainHeadRoundStart)
 
 	// is the current chain head from the future ?
 	if d < 0 {
-		r.logger.Info("RRR alignFailedAttempts - future block ?", "d", d, "now", now, "th", r.chainHeadSealTime)
+		r.logger.Info("RRR alignFailedAttempts - future block ?", "d", d, "now", now, "th", r.chainHeadRoundStart)
 		return 0
 	}
 
 	f := uint32(d / rl)
 
-	r.logger.Debug("RRR alignFailedAttempts", "f", f, "fprevious", fprevious, "delta", f-fprevious)
+	r.logger.Trace("RRR alignFailedAttempts", "f", f, "fprevious", fprevious, "delta", f-fprevious)
 	if f < fprevious {
-		r.logger.Info("RRR alignFailedAttempts - f < fprevious", "f", f, "fprevious", fprevious, "delta", fprevious-f)
+		r.logger.Info("RRR alignFailedAttempts - noop, f < fprevious", "f", f, "fprevious", fprevious, "delta", fprevious-f)
 		return f
 	}
 
 	if f == fprevious {
-		r.logger.Info("RRR alignFailedAttempts - f = fprevious", "f", f)
+		r.logger.Trace("RRR alignFailedAttempts - noop, f = fprevious", "f", f)
 		return f
 	}
 
 	if r.a.NumActive() <= int(r.config.Endorsers) {
-		r.logger.Info(
-			"RRR alignFailedAttempts - na < ne, no need to sample",
+		r.logger.Debug(
+			"RRR alignFailedAttempts - noop, na < ne",
 			"na", r.a.NumActive())
 		return f
 	}
@@ -555,7 +577,7 @@ func (r *EndorsmentProtocol) electAndPropose(b Broadcaster) {
 	// If there is a current seal task, it will be resused, no matter
 	// how long it has been since the local node was a leader
 	// candidate.
-	if err := r.refreshSealTask(r.chainHeadExtraHeader.Seed, r.Number, r.FailedAttempts); err != nil {
+	if err := r.refreshSealTask(r.chainHeadExtraHeader.Seed, r.Number); err != nil {
 		r.logger.Info("RRR newHead refreshSealTask", "err", err)
 		return
 	}

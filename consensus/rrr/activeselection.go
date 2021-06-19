@@ -50,6 +50,9 @@ type idActivity struct {
 	// esbalishAge
 	ageBlock *big.Int
 
+	// ageRound is the round number the idenity was most recently active in - as per ageBlock
+	ageRound uint64
+
 	// endorsedHash is the hash of the block most recently endorsed by the
 	// identity
 	endorsedHash Hash
@@ -57,6 +60,9 @@ type idActivity struct {
 	// endorsedBlock is the number of the block most recently endorsed by the
 	// identity
 	endorsedBlock *big.Int
+	// endorsedRound is the round number that produced the last block endorsed
+	// by the identity.
+	endorsedRound uint64
 
 	// oldestFor - the number of rounds the identity has been found to be the
 	// oldest. Reset only after the identity mints a block. Excludes inactive
@@ -284,6 +290,11 @@ func (a *activeList) AccumulateActive(
 			break
 		}
 
+		var curRound uint64
+		if curRound, err = cur.GetRound(a.codec); err != nil {
+			return fmt.Errorf("bad seal, failed to decode: %w", err)
+		}
+
 		// If we have exceeded the Ta depth horizon we are done. Note we do this
 		// directly on the number in the header and the activity, rather than
 		// relying on the cached activeBlockFence.
@@ -320,10 +331,10 @@ func (a *activeList) AccumulateActive(
 		a.enrolIdentities(
 			chainID, youngestKnown,
 			blockActivity.SealerID, blockActivity.SealerPub, blockActivity.Enrol,
-			h, hseal, curNumber)
+			h, hseal, curNumber, curRound)
 
 		// The sealer is the oldest of those identities active for this block and so is added last.
-		a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, 0)
+		a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, curRound, 0)
 
 		// The endorsers are active, they do not move in the age ordering.
 		// Note however, for any identity enrolled after genesis, as we are
@@ -335,7 +346,7 @@ func (a *activeList) AccumulateActive(
 		for _, end := range blockActivity.Confirm {
 			// xxx: should probably log when we see a confirmation for an
 			// enrolment we haven't had yet, that is 'interesting'
-			a.recordActivity(end.EndorserID, h, curNumber)
+			a.recordActivity(end.EndorserID, h, curNumber, curRound)
 		}
 
 		// a.logger.Trace("RRR accumulateActive - parent", "cur", cur.Hash(), "parent", cur.GetParentHash())
@@ -512,7 +523,7 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 		// non-leader candidate entries in active. So any endorserPosition ==
 		// an element in the permutation is selected as an endorser.
 		//
-		if ipermutation < len(permutation) && permutation[ipermutation]+endorserOffset == inext {
+		if ipermutation < len(permutation) && permutation[ipermutation]+endorserOffset == icur {
 
 			ipermutation++
 
@@ -537,6 +548,9 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 	a.logSelection(candidates, endorsers, selection, nCandidates, nEndorsers)
 
 	a.logger.Debug("RRR selectCandEs - iendorsers", "p", permutation)
+	if len(selection)-int(nCandidates) == 0 {
+		a.logger.Trace("RRR selectCandEs - no endorsers selected")
+	}
 
 	return candidates, endorsers, selection, nil
 }
@@ -622,17 +636,15 @@ func (a *idActivity) lastActiveBlock() *big.Int {
 
 func (a *activeList) enrolIdentities(
 	chainID Hash, fence *list.Element, sealerID Hash,
-	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, number *big.Int,
+	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, blockNumber *big.Int, roundNumber uint64,
 ) error {
 
-	enbind := &EnrolmentBinding{
-		Round: big.NewInt(0),
-	}
+	enbind := EnrolmentBinding{}
 
 	// Gensis block can't refer to itself
-	if number.Cmp(big0) > 0 {
+	if roundNumber > 0 {
 		enbind.ChainID = chainID
-		enbind.Round.Set(number)
+		enbind.Round = roundNumber
 		enbind.BlockHash = blockSeal
 	}
 
@@ -641,7 +653,7 @@ func (a *activeList) enrolIdentities(
 		enbind.NodeID = e.ID
 		enbind.ReEnrol = reEnrol
 
-		u, err := a.codec.HashEnrolmentBinding(enbind)
+		u, err := a.codec.HashEnrolmentBinding(&enbind)
 		if err != nil {
 			return false, err
 		}
@@ -699,12 +711,12 @@ func (a *activeList) enrolIdentities(
 		if sealerID == enr.ID {
 			a.logger.Trace(
 				"RRR enrolIdentities - sealer found in enrolments",
-				"bn", number, "#", block.Hex())
+				"bn", blockNumber, "r", roundNumber, "#", block.Hex())
 			continue
 		}
-		a.logger.Info("RRR enroled identity", "id", enr.ID.Hex(), "bn", number, "#", block.Hex())
+		a.logger.Info("RRR enroled identity", "id", enr.ID.Hex(), "bn", blockNumber, "r", roundNumber, "#", block.Hex())
 
-		a.refreshAge(fence, enr.ID, block, number, order)
+		a.refreshAge(fence, enr.ID, block, blockNumber, roundNumber, order)
 	}
 	return nil
 }
@@ -719,7 +731,7 @@ func newIDActivity(nodeID Hash) *idActivity {
 
 // recordActivity is called for a node to indicate it is active in the current
 // round. Inactive entries are culled by selectCandidatesAndEndorsers
-func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big.Int) *idActivity {
+func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big.Int, roundNumber uint64) *idActivity {
 
 	var aged *idActivity
 	nodeAddr := nodeID.Address()
@@ -739,6 +751,7 @@ func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big
 	}
 	aged.endorsedHash = endorsed
 	aged.endorsedBlock.Set(blockNumber)
+	aged.endorsedRound = roundNumber
 
 	return aged
 }
@@ -756,7 +769,7 @@ func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big
 // order of age. Taken all together, this give us an efficient way to always
 // have identities sorted in age order.
 func (a *activeList) refreshAge(
-	fence *list.Element, nodeID Hash, block Hash, blockNumber *big.Int, order int,
+	fence *list.Element, nodeID Hash, block Hash, blockNumber *big.Int, roundNumber uint64, order int,
 ) {
 	var aged *idActivity
 
@@ -784,6 +797,7 @@ func (a *activeList) refreshAge(
 				a.activeSelection.MoveToBack(el)
 			}
 			aged.ageBlock.Set(blockNumber)
+			aged.ageRound = roundNumber
 			aged.ageHash = block
 			aged.oldestFor = 0
 			aged.order = order
@@ -807,6 +821,7 @@ func (a *activeList) refreshAge(
 		delete(a.idlePool, nodeAddr)
 
 		aged.ageBlock.Set(blockNumber)
+		aged.ageRound = roundNumber
 		aged.ageHash = block
 		aged.oldestFor = 0
 		aged.order = order

@@ -27,13 +27,17 @@ type RoundTimeOption func(r *RoundTime)
 func NewRoundTime(
 	config *Config, opts ...RoundTimeOption) RoundTime {
 
-	roundDuration := time.Duration(config.RoundLength) * time.Second
+	rl := time.Duration(config.RoundLength) * time.Millisecond
+	i := time.Duration(config.IntentPhase) * time.Millisecond
 	c := time.Duration(config.ConfirmPhase) * time.Millisecond
+	if i+c >= rl {
+		panic("RRR intent + confirm must be less than the round length")
+	}
 	t := RoundTime{
-		RoundLength: roundDuration,
-		Confirm:     c / 2,
-		Intent:      c - (c / 2),
-		Broadcast:   roundDuration - c,
+		RoundLength: rl,
+		Intent:      i,
+		Confirm:     c,
+		Broadcast:   rl - (i + c),
 	}
 
 	for _, o := range opts {

@@ -7,7 +7,6 @@ package rrr
 import (
 	"encoding/hex"
 	"fmt"
-	"math/big"
 	"time"
 )
 
@@ -28,7 +27,7 @@ type EngSealTask struct {
 	Committer   SealCommitter
 	// RoundNumber the Seal was requested. Filled in by the endorsment protocol
 	// when it retrieves the task of the run queue.
-	RoundNumber *big.Int
+	RoundNumber uint64
 }
 
 type pendingIntent struct {
@@ -53,7 +52,7 @@ func (r *EndorsmentProtocol) NewSealTask(b Broadcaster, et *EngSealTask) {
 		"state", r.state.String(), "addr", r.nodeAddr.Hex(),
 		"r", r.Number, "f", r.FailedAttempts)
 
-	et.RoundNumber = big.NewInt(0).Set(r.Number)
+	et.RoundNumber = r.Number
 
 	// Note: we don't reset the attempt if we get a new seal task.
 	if err := r.newSealTask(r.state, et, r.Number, r.FailedAttempts); err != nil {
@@ -71,7 +70,7 @@ func (r *EndorsmentProtocol) NewSealTask(b Broadcaster, et *EngSealTask) {
 }
 
 func (r *EndorsmentProtocol) newSealTask(
-	state RoundState, et *EngSealTask, roundNumber *big.Int, failedAttempts uint32,
+	state RoundState, et *EngSealTask, roundNumber uint64, failedAttempts uint32,
 ) error {
 	var err error
 	r.intentMu.Lock()
@@ -79,7 +78,7 @@ func (r *EndorsmentProtocol) newSealTask(
 
 	var newIntent *pendingIntent
 	if newIntent, err = r.newPendingIntent(
-		et, r.chainHeadExtraHeader.Seed, roundNumber, failedAttempts); err != nil {
+		et, r.chainHeadExtraHeader.Seed, roundNumber); err != nil {
 		return err
 	}
 
@@ -93,7 +92,7 @@ func (r *EndorsmentProtocol) newSealTask(
 // issued an intent for this round and we are still in the intent phase, we just
 // issue another. Endorsing peers will endorse the *most recent* intent from the
 // *oldest* identity they have selected as leader.
-func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber *big.Int, failedAttempts uint32) error {
+func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber uint64) error {
 
 	var err error
 	r.intentMu.Lock()
@@ -111,7 +110,7 @@ func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber *big
 
 	// The roundNumber or failedAttempts has to change in order for the message
 	// to be broadcast.
-	newIntent, err := r.newPendingIntent(r.sealTask, parentSeed, roundNumber, failedAttempts)
+	newIntent, err := r.newPendingIntent(r.sealTask, parentSeed, roundNumber)
 	if err != nil {
 		return fmt.Errorf("refreshSealTask - newPendingIntent: %v", err)
 	}
@@ -124,12 +123,11 @@ func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber *big
 }
 
 func (r *EndorsmentProtocol) newPendingIntent(
-	et *EngSealTask, parentSeed []byte, roundNumber *big.Int,
-	failedAttempts uint32) (*pendingIntent, error) {
+	et *EngSealTask, parentSeed []byte, roundNumber uint64) (*pendingIntent, error) {
 
 	var err error
 
-	r.logger.Trace("RRR newPendingIntent", "r", roundNumber, "f", failedAttempts)
+	r.logger.Trace("RRR newPendingIntent", "r", roundNumber)
 	if len(parentSeed) != 32 {
 		return nil, fmt.Errorf("parent seed wrong length want 32 not %d", len(parentSeed))
 	}
@@ -146,12 +144,11 @@ func (r *EndorsmentProtocol) newPendingIntent(
 	// this node to mine this block
 	pe.SI = &SignedIntent{
 		Intent: Intent{
-			ChainID:        r.genesisEx.ChainID,
-			NodeID:         r.nodeID,
-			RoundNumber:    big.NewInt(0).Set(roundNumber),
-			FailedAttempts: failedAttempts,
-			ParentHash:     Hash(et.BlockHeader.GetParentHash()),
-			TxHash:         Hash(et.BlockHeader.GetTxHash()), // the hash is computed by NewBlock
+			ChainID:     r.genesisEx.ChainID,
+			NodeID:      r.nodeID,
+			RoundNumber: roundNumber,
+			ParentHash:  Hash(et.BlockHeader.GetParentHash()),
+			TxHash:      Hash(et.BlockHeader.GetTxHash()), // the hash is computed by NewBlock
 		},
 	}
 
@@ -199,7 +196,7 @@ func (r *EndorsmentProtocol) NewSignedEndorsement(et *EngSignedEndorsement) {
 	// endorsment will be included in the block - whether we needed it to reach
 	// the endorsment quorum or not.
 	if err := r.handleEndorsement(et); err != nil {
-		r.logger.Info("RRR run handleIntent", "err", err)
+		r.logger.Info("RRR run handleEndorsement", "err", err)
 	}
 }
 
@@ -355,7 +352,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 	for _, eb := range r.pendingEnrolments {
 
 		// The round and block hash are not known when the enrolment is queued.
-		eb.Round.Set(r.Number)
+		eb.Round = r.Number
 		eb.BlockHash = r.intent.SealHash
 
 		u, err := r.codec.HashEnrolmentBinding(eb)

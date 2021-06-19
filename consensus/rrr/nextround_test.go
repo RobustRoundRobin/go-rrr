@@ -84,7 +84,7 @@ func TestAlignFailedAttempts(t *testing.T) {
 		name         string
 		headSealTime time.Time
 		now          time.Time
-		headRound    int64
+		headRound    uint64
 		fcarry       uint32
 		roundLength  uint64
 		endorsers    uint64
@@ -94,11 +94,11 @@ func TestAlignFailedAttempts(t *testing.T) {
 		{
 			"perfect start",
 			now, now,
-			0, // rh (headRound)
-			0, // fcarry
-			5, // roundLength
-			3, // endorsers
-			5, // num active
+			0,    // rh (headRound)
+			0,    // fcarry
+			5000, // roundLength
+			3,    // endorsers
+			5,    // num active
 			0,
 		},
 	}
@@ -111,8 +111,9 @@ func TestAlignFailedAttempts(t *testing.T) {
 					RoundLength: test.roundLength,
 					Endorsers:   test.endorsers,
 				},
-				chainHeadSealTime: test.headSealTime,
-				a:                 &activeSelection{logger: logger, numActive: test.nActive},
+				roundLength:         time.Duration(test.roundLength) * time.Millisecond,
+				chainHeadRoundStart: test.headSealTime,
+				a:                   &activeSelection{logger: logger, numActive: test.nActive},
 			}
 			factual := r.alignFailedAttempts(test.now, test.headRound, test.fcarry)
 			assert.Equal(t, factual, test.fexpect)

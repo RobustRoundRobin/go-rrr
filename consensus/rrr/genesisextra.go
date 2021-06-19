@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/big"
 	"time"
 
 	"github.com/vechain/go-ecvrf"
@@ -54,14 +53,12 @@ func IdentInit(
 
 	// Use a mostly empty binding for genesis. We do to limit the special
 	// handling for the genesis block when validating enrolments.
-	eb := &EnrolmentBinding{
-		Round: big.NewInt(0),
-	}
+	eb := EnrolmentBinding{}
 
 	for i, id := range nodeids {
 
 		eb.NodeID = id
-		u, err := codec.HashEnrolmentBinding(eb)
+		u, err := codec.HashEnrolmentBinding(&eb)
 		if err != nil {
 			return nil, err
 		}
