@@ -318,8 +318,7 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 	r.candidates, r.endorsers, r.selection, err = r.a.SelectCandidatesAndEndorsers(
 		r.activeSample,
 		uint32(r.config.Candidates), uint32(r.config.Endorsers), uint32(r.config.Quorum),
-		uint32(r.config.Activity),
-		r.FailedAttempts)
+		uint32(r.config.Activity))
 	if err != nil {
 		return RoundStateInactive, err
 	}
@@ -480,6 +479,14 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 // replacement.  This is contrary to the paper because replacement causes issues
 // for small networks in the case where endorsers are selected more than once by
 // the same permutation.
+
+// TODO: We use the method described in 4 here
+// 	https://cs.stackexchange.com/questions/104930/efficient-n-choose-k-random-sampling
+// See also Knuth V2.3.4.2 Algorithm S, and the improvements on it offered in
+// the answer to ex 8 and here
+// http://www.ittc.ku.edu/~jsv/Papers/Vit84.sampling.pdf.
+// for theoretical background and pseudo code. The methods guarantee that any
+// single element would be selected with P nEndorsers/nActive
 func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 
 	// DIVERGENCE (5) we do sample *without* replacement because replacement
@@ -491,19 +498,20 @@ func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 	// This will force select them all active identities when na <= ns. na=0
 	// is not special.
 	if nactive <= nsamples {
+		r.logger.Trace("RRR nextActiveSample - returning identity sample, to few active", "na", nactive, "ns", nsamples)
 		for i := 0; i < nsamples; i++ {
 			s[i] = i
 		}
 		return s
 	}
 
-	// For efficiency, when na is close to ns, we randomly eliminate indices
-	// until we only have nsamples left. TODO Measure a good value for 'close'.
-	// For now we define na < nsamples * 2 as 'close', but that was pretty
-	// arbitrary.
+	// if nactive isn't at least twice as big as nsamples, invert the process
+	// and evict randomly chosen elements.
 	if nactive < nsamples*2 {
 
-		for i := 0; i < len(s); i++ {
+		s = make([]int, nactive)
+
+		for i := 0; i < nactive; i++ {
 			s[i] = i
 		}
 

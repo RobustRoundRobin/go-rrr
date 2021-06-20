@@ -359,13 +359,25 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	// Do we agree that the intendee is next in line and that their intent is
 	// appropriate ?
 
-	// XXX: TODO NTP rounds only for endorser and Phase check ?
 	if !r.endorsers[r.nodeAddr] {
-		return fmt.Errorf("RRR handleIntent - not selected as an endorser, ignoring intent for round %d", et.RoundNumber)
+		r.logger.Debug(
+			"RRR handleIntent - not selected as an endorser, ignoring intent",
+			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address())
+		return nil
 	}
 
 	if r.Phase != RoundPhaseIntent {
-		return fmt.Errorf("RRR handleIntent - not in intent phase, ignoring intent for round %d", et.RoundNumber)
+		r.logger.Debug(
+			"RRR handleIntent - not in intent phase, ignoring intent",
+			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address())
+		return nil
+	}
+
+	// Check that the intent round matches our current round.
+	if r.Number != et.RoundNumber {
+		r.logger.Debug("RRR handleIntent - wrong round",
+			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address().Hex())
+		return nil
 	}
 
 	// Check that the public key recovered from the intent signature matches
@@ -378,31 +390,19 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	intenderAddr := et.NodeID.Address()
 
 	if recoveredNodeID != et.NodeID {
-		r.logger.Info("RRR handleIntent - sender not signer",
-			"from-addr", intenderAddr.Hex(), "recovered", recoveredNodeID.Hex(),
-			"signed", et.NodeID.Hex())
+		r.logger.Debug("RRR handleIntent - sender not signer",
+			"recovered", recoveredNodeID.Hex(), "signed", et.NodeID.Hex(),
+			"from-addr", intenderAddr.Hex())
 		return nil
 	}
-
-	// Check that the intent round matches our current round.
-	if r.Number != et.RoundNumber {
-		r.logger.Info("RRR handleIntent - wrong round",
-			"r", r.Number, "ir", et.RoundNumber, "from-addr", intenderAddr.Hex())
-		return nil
-	}
-
-	// Number of rounds that did not produce a block (failedAttempts).
-	f := uint32(et.RoundNumber - r.chainHeadRound)
 
 	// Check that the intent comes from a node we have selected locally as a
 	// leader candidate. According to the (matching) roundNumber
-	if !r.a.LeaderForRoundAttempt(
-		uint32(r.config.Candidates), uint32(r.config.Endorsers),
-		intenderAddr, f) {
-		r.logger.Info(
+	if !r.candidates[intenderAddr] {
+		r.logger.Debug(
 			"RRR handleIntent - intent from non-candidate",
-			"round", r.Number, "f", f, "cand", intenderAddr.Hex())
-		return ErrNotLeaderCandidate
+			"round", r.Number, "cand", intenderAddr.Hex())
+		return nil
 	}
 
 	if r.signedIntent != nil {
@@ -416,7 +416,7 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 			// current is older
 			r.logger.Trace(
 				"RRR handleIntent - ignoring intent from younger candidate",
-				"cand-addr", intenderAddr.Hex(), "f", f)
+				"cand-addr", intenderAddr.Hex())
 			return nil
 		}
 	}

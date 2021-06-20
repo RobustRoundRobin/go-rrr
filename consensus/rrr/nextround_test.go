@@ -57,7 +57,7 @@ func (a *activeSelection) AccumulateActive(
 }
 
 func (a *activeSelection) SelectCandidatesAndEndorsers(
-	permutation []int, nCandidates, nEndorsers, quorum, activityHorizon, failedAttempts uint32,
+	permutation []int, nCandidates, nEndorsers, quorum, activityHorizon uint32,
 ) (map[Address]bool, map[Address]bool, []Address, error) {
 	return nil, nil, nil, nil
 }
