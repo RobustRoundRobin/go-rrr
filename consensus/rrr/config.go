@@ -12,6 +12,11 @@ type Config struct {
 	Quorum            uint64 `toml:",omitempty"` // Number of endorsments required to confirm an intent
 	Activity          uint64 `toml:",omitempty"` // Activity threshold (Ta) (in blocks). Any identity with confirmation messages recorded within this many rounds of the head are considered active.
 	StablePrefixDepth uint64 `toml:"omitempty"`  // d stable block prefix (for seed r-d)
+
+	// MinIdleAttempts if the identity is oldest for
+	// MAX(Candidates,MinIdleAttempts) it is made idle. Used to avoid over
+	// agressive idling in small networks.
+	MinIdleAttempts uint64 `toml:"omitempty"`
 }
 
 // DefaultConfig provides the default rrr consensus configuration
@@ -25,4 +30,5 @@ var DefaultConfig = &Config{
 	Quorum:            4,
 	Activity:          200,
 	StablePrefixDepth: 6,
+	MinIdleAttempts:   5,
 }

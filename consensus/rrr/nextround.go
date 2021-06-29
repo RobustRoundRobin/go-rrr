@@ -135,16 +135,7 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 
 		case RoundStateLeaderCandidate:
 
-			if confirmed, err := r.sealCurrentBlock(chain); confirmed {
-
-				r.logger.Info(
-					"RRR PhaseTick - sealed block", "addr", r.nodeAddr.Hex(),
-					"r", r.Number, "f", r.FailedAttempts)
-
-			} else if err != nil {
-
-				r.logger.Warn("RRR PhaseTick - sealCurrentBlock", "err", err)
-			}
+			r.completeLeaderConfirmPhase(chain)
 
 		case RoundStateInactive:
 			r.logger.Debug("RRR PhaseTick", "state", r.state.String())
@@ -181,6 +172,7 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 			// happen at any time, and it will update the DRGB and so on imediately,
 			// but that won't disturb the selections made here.
 			r.electAndPropose(b)
+
 		case offset < endConfirm:
 			r.Phase = RoundPhaseConfirm
 			r.T.Reset(endConfirm - offset)
@@ -206,10 +198,127 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 			r.logger.Warn("RRR PhaseTick - round offset to large", "offset", offset, "advanced", roundAdvanced)
 		}
 
+		// If we have gone idle, attempt to re-enrol
+		r.autoEnrolSelf(b)
+
 	default:
 		panic("TODO - recovery")
 	}
 
+}
+
+func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
+
+	r.intentMu.Lock()
+	defer r.intentMu.Unlock()
+	r.pendingEnrolmentsMu.Lock()
+	defer r.pendingEnrolmentsMu.Unlock()
+
+	n := r.getNumEndorsements()
+	switch {
+	case n < 0:
+		r.logger.Debug("RRR no outstanding intent")
+		return
+	case n == 0:
+		// if we see no endorsements for max(nc, min-attempts),
+		// assume we have been idled by the other nodes and enter
+		// the re-enroling state.
+		r.logger.Debug("RRR zero confirmations - intiate self re-enrol")
+		r.reEnrolSelf = true
+		return
+	case n < int(r.config.Quorum):
+		r.logger.Trace("RRR some confirmations - cancel any pending self re-enrol")
+		r.reEnrolSelf = false
+
+		r.logger.Info("RRR insufficient endorsers to become leader",
+			"q", int(r.config.Quorum), "got", n)
+		return
+	default:
+		r.logger.Trace("RRR got quorum of confirmations - cancel any pending self re-enrol")
+		r.reEnrolSelf = false
+
+		r.logger.Info("RRR confirmed as leader",
+			"q", int(r.config.Quorum), "got", len(r.intent.Endorsements))
+
+		if r.sealTask == nil {
+			r.logger.Trace("RRR seal task canceled or discarded")
+			return
+		}
+
+		err := r.verifyEndorsements()
+		if err != nil {
+			r.logger.Info("RRR PhaseTick - verifyEndorsements", "err", err)
+			return
+		}
+		beta, pi, err := r.generateIntentSeedProof()
+		if err != nil {
+			r.logger.Info("RRR PhaseTick - generateIntentSeedProof", "err", err)
+			return
+		}
+
+		// At this point we expect to have everything we need to seal the block
+		// so its an error if we can't
+		err = r.sealCurrentBlock(beta, pi, chain)
+		if err != nil {
+			r.logger.Warn("RRR PhaseTick - sealCurrentBlock", "err", err)
+			return
+		}
+		r.logger.Info(
+			"RRR PhaseTick - sealed block", "addr", r.nodeAddr.Hex(),
+			"r", r.Number, "f", r.FailedAttempts)
+	}
+}
+
+func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
+
+	if !r.reEnrolSelf {
+		return
+	}
+
+	var reEnrolers []Address
+
+	if r.chainHeadExtra != nil {
+		reEnrolers = append(reEnrolers, r.chainHeadExtra.Intent.NodeID.Address())
+	}
+
+	// Enrolments are included by the leader. The fastest re-enrol is achived
+	// by sending our request to all of the leaders for the next round.
+	if others := r.otherCandidates(r.nodeID.Address()); len(others) > 0 {
+		reEnrolers = others
+	}
+
+	if r.a.IsActive(r.nodeID.Address()) {
+		return
+	}
+
+	if reEnrolers == nil {
+		r.logger.Info("RRR PhaseTick - no reEnrolers found for idle node")
+		return
+	}
+
+	rmsg, err := r.newEnrolIdentityMsg(r.nodeID, true)
+	if err != nil {
+		r.logger.Info("RRR PhaseTick - encoding auto reenrol msg", "err", err)
+	}
+	msg, err := r.codec.EncodeToBytes(rmsg)
+	if err != nil {
+		r.logger.Info("RRR PhaseTick - encoding RMsgEnrol", "err", err.Error())
+		return
+	}
+
+	m := map[Address]bool{}
+	for _, addr := range reEnrolers {
+		m[addr] = true
+	}
+	peers := b.FindPeers(m)
+
+	err = b.Broadcast(r.nodeAddr, peers, msg)
+	if err != nil {
+		r.logger.Info("RRR PhaseTick - Broadcasting RMsgEnrol", "err", err.Error())
+		return
+	}
+	r.logger.Info("RRR PhaseTick - Broadcasted RMsgEnrol")
+	r.reEnrolSelf = false
 }
 
 // setChainHead updates the chain head state variables *including* the Rand
@@ -272,7 +381,7 @@ func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head Bloc
 	// of the number of attempts required to produce a block in any given
 	// round.
 	err := r.a.AccumulateActive(
-		r.genesisEx.ChainID, r.config.Activity, chain, head)
+		r.genesisEx.ChainID, chain, head)
 	if err == nil {
 		return nil
 	}
@@ -283,10 +392,10 @@ func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head Bloc
 	}
 
 	// re build the whole selection from new head back Ta worth of blocks
-	r.a.Reset(r.config.Activity, head)
+	r.a.Reset(head)
 
 	if err := r.a.AccumulateActive(
-		r.genesisEx.ChainID, r.config.Activity, chain, head); err == nil {
+		r.genesisEx.ChainID, chain, head); err == nil {
 		return nil
 	}
 	r.logger.Warn("RRR resetActive failed to recover from re-org", "err", err)
@@ -316,9 +425,7 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 
 	// If we are a leader candidate we need to broadcast an intent.
 	r.candidates, r.endorsers, r.selection, err = r.a.SelectCandidatesAndEndorsers(
-		r.activeSample,
-		uint32(r.config.Candidates), uint32(r.config.Endorsers), uint32(r.config.Quorum),
-		uint32(r.config.Activity))
+		r.activeSample)
 	if err != nil {
 		return RoundStateInactive, err
 	}
@@ -327,6 +434,10 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 	// leadership status.
 	r.OnlineEndorsers = b.FindPeers(r.endorsers)
 
+	// XXX: TODO if we are not selected as leader, there is no harm in being in
+	// RoundStateEndorserCommittee. Also, we may not be able to directly
+	// connect in larger networks at all. We may need to adjust this to send to
+	// *any* peer so that the gossip can work
 	if len(r.OnlineEndorsers) < int(r.config.Quorum) {
 		// XXX: possibly it should be stricter and require e.config.Endorsers
 		// online
@@ -489,7 +600,7 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 // single element would be selected with P nEndorsers/nActive
 func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 
-	// DIVERGENCE (5) we do sample *without* replacement because replacement
+	// divergence (3) we do sample *without* replacement because replacement
 	// predjudices the quorum in small networks (and network initialisation)
 
 	nsamples := len(s)
@@ -637,4 +748,17 @@ func (r *EndorsmentProtocol) readSeal(header BlockHeader) (*SignedExtraData, err
 	}
 
 	return se, nil
+}
+
+// otherCandidate returns the first candidate it finds that is not the
+// `exclude` candidate or the empty Address if it finds none
+func (r *EndorsmentProtocol) otherCandidates(exclude Address) []Address {
+	var others []Address
+	for addr := range r.candidates {
+		if addr == r.nodeID.Address() {
+			continue
+		}
+		others = append(others, addr)
+	}
+	return others
 }

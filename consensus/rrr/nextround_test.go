@@ -51,30 +51,31 @@ type activeSelection struct {
 }
 
 func (a *activeSelection) AccumulateActive(
-	chainID Hash, activity uint64, chain blockHeaderReader, head BlockHeader,
+	chainID Hash, chain blockHeaderReader, head BlockHeader,
 ) error {
 	return nil
 }
 
 func (a *activeSelection) SelectCandidatesAndEndorsers(
-	permutation []int, nCandidates, nEndorsers, quorum, activityHorizon uint32,
+	permutation []int,
 ) (map[Address]bool, map[Address]bool, []Address, error) {
 	return nil, nil, nil, nil
 }
 
 func (a *activeSelection) LeaderForRoundAttempt(
-	nCandidates, nEndorsers uint32, id Address, failedAttempts uint32) bool {
+	nCandidates, nEndorsers uint32, id Address) bool {
 	return true
 }
-func (a *activeSelection) Reset(activity uint64, head BlockHeader) {
+func (a *activeSelection) Reset(head BlockHeader) {
 }
-func (a *activeSelection) Prime(activity uint64, head BlockHeader) {}
-func (a *activeSelection) YoungestNodeID() Hash                    { return Hash{} }
-func (a *activeSelection) AgeOf(nodeID Address) *big.Int           { return nil }
-func (a *activeSelection) NumActive() int                          { return a.numActive }
-func (a *activeSelection) NumKnown() int                           { return a.numActive }
-func (a *activeSelection) NumIdle() int                            { return 0 }
-
+func (a *activeSelection) Prime(head BlockHeader)        {}
+func (a *activeSelection) YoungestNodeID() Hash          { return Hash{} }
+func (a *activeSelection) AgeOf(nodeID Address) *big.Int { return nil }
+func (a *activeSelection) NumActive() int                { return a.numActive }
+func (a *activeSelection) NumKnown() int                 { return a.numActive }
+func (a *activeSelection) NumIdle() int                  { return 0 }
+func (a *activeSelection) IdleLeader() Address           { return Address{} }
+func (a *activeSelection) IsActive(addr Address) bool    { return true }
 func TestAlignFailedAttempts(t *testing.T) {
 
 	now := time.Now()

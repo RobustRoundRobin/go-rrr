@@ -50,27 +50,26 @@ func (r *EndorsmentProtocol) NewSealTask(b Broadcaster, et *EngSealTask) {
 
 	r.logger.Trace("RRR engSealTask",
 		"state", r.state.String(), "addr", r.nodeAddr.Hex(),
-		"r", r.Number, "f", r.FailedAttempts)
+		"r", r.Number)
 
 	et.RoundNumber = r.Number
 
 	// Note: we don't reset the attempt if we get a new seal task.
-	if err := r.newSealTask(r.state, et, r.Number, r.FailedAttempts); err != nil {
+	if err := r.newSealTask(r.state, et, r.Number); err != nil {
 		r.logger.Info("RRR engSealTask - newSealTask", "err", err)
 	}
 
 	if r.state == RoundStateLeaderCandidate && r.Phase == RoundPhaseIntent {
 
 		r.logger.Trace(
-			"RRR engSealTask - broadcasting intent (new)", "addr", r.nodeAddr.Hex(),
-			"r", r.Number, "f", r.FailedAttempts)
+			"RRR engSealTask - broadcasting intent (new)", "addr", r.nodeAddr.Hex(), "r", r.Number)
 
 		r.broadcastCurrentIntent(b)
 	}
 }
 
 func (r *EndorsmentProtocol) newSealTask(
-	state RoundState, et *EngSealTask, roundNumber uint64, failedAttempts uint32,
+	state RoundState, et *EngSealTask, roundNumber uint64,
 ) error {
 	var err error
 	r.intentMu.Lock()
@@ -88,10 +87,10 @@ func (r *EndorsmentProtocol) newSealTask(
 }
 
 // refreshSealTask will update the current intent to use the provided
-// roundNumber and failedAttempts. The effects are imediate, if we have already
-// issued an intent for this round and we are still in the intent phase, we just
-// issue another. Endorsing peers will endorse the *most recent* intent from the
-// *oldest* identity they have selected as leader.
+// roundNumber. The effects are immediate, if we have already issued an intent
+// for this round and we are still in the intent phase, we just issue another.
+// Endorsing peers will endorse the *most recent* intent from the *oldest*
+// identity they have selected as leader.
 func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber uint64) error {
 
 	var err error
@@ -108,8 +107,7 @@ func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber uint
 		return nil
 	}
 
-	// The roundNumber or failedAttempts has to change in order for the message
-	// to be broadcast.
+	// The roundNumber has to change in order for the message to be broadcast.
 	newIntent, err := r.newPendingIntent(r.sealTask, parentSeed, roundNumber)
 	if err != nil {
 		return fmt.Errorf("refreshSealTask - newPendingIntent: %v", err)
@@ -180,12 +178,12 @@ func (r *EndorsmentProtocol) NewSignedEndorsement(et *EngSignedEndorsement) {
 		return
 	}
 
-	// XXX: divergence (3) the paper handles endorsements only in the
-	// confirmation phase. It is important that all identities get an
-	// opportunity to record activity. I think the key point is that a quorum of
-	// fast nodes can't starve 'slow' nodes. So as long as the window is
-	// consistent for all, it doesn't really matter what it is. And it is (a
-	// little) easier to just accept endorsements at any time in the round.
+	if r.Phase != RoundPhaseConfirm {
+		r.logger.Trace("RRR engSignedEndorsement - ignoring endorsement received out of phase",
+			"round", r.Number,
+			"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
+		return
+	}
 
 	r.logger.Trace("RRR engSignedEndorsement",
 		"round", r.Number,
@@ -269,6 +267,60 @@ type sealChainReader interface {
 	GetHeaderByNumber(number uint64) BlockHeader
 }
 
+// call with intentMu held
+func (r *EndorsmentProtocol) getNumEndorsements() int {
+	if r.intent == nil {
+		// r.logger.Debug("RRR no outstanding intent")
+		return -1
+	}
+	return len(r.intent.Endorsements)
+}
+
+// verifyEndorsements verifies the endorsements for the current intent.
+// ** call with intentMu held
+func (r *EndorsmentProtocol) verifyEndorsements() error {
+
+	// All of these error cases indicate getNumEndorsements has not been used
+	// correctly
+	if r.intent == nil {
+		return fmt.Errorf("RRR no outstanding intent")
+	}
+
+	if len(r.intent.Endorsements) == 0 {
+		return fmt.Errorf("RRR no endorsments received")
+	}
+
+	if len(r.intent.Endorsements) < int(r.config.Quorum) {
+		return fmt.Errorf("RRR to few endorsments received")
+	}
+
+	intentHash, err := r.codec.HashIntent(&r.intent.SI.Intent)
+	if err != nil {
+		return err
+	}
+
+	// Now check all the endorsments are for the intent
+	for _, end := range r.intent.Endorsements {
+		if intentHash != end.IntentHash {
+			return fmt.Errorf(
+				"endorsement intenthash mismatch. endid=%s", end.EndorserID.Hex())
+		}
+	}
+
+	return nil
+}
+
+// ** call with intentMu held
+func (r *EndorsmentProtocol) generateIntentSeedProof() ([]byte, []byte, error) {
+	// The alpha here is always from the block we are building on, which is updated by refreshSealTask
+	beta, pi, err := r.vrf.Prove(r.privateKey, r.intent.Alpha)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed proving new seed: %v", err)
+	}
+
+	return beta, pi, nil
+}
+
 // sealCurrentBlock completes the current block sealing task if the node
 // has received the confirmations required to mine a block. If this function
 // returns true, RRR has entered the "block disemination" phase. Which, in this
@@ -276,60 +328,16 @@ type sealChainReader interface {
 // arrangements in geth (and its eth/devp2p machinery). Note that this is
 // called on all nodes, only legitemate leader candidates will recieve enough
 // endorsments for non-byzantine scenarios.
-func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, error) {
-
-	r.intentMu.Lock()
-	defer r.intentMu.Unlock()
-	r.pendingEnrolmentsMu.Lock()
-	defer r.pendingEnrolmentsMu.Unlock()
-
-	if r.intent == nil {
-		r.logger.Debug("RRR no outstanding intent")
-		return false, nil
-	}
-
-	if len(r.intent.Endorsements) == 0 {
-		r.logger.Debug("RRR no endorsments received")
-		return false, nil
-	}
-
-	if len(r.intent.Endorsements) < int(r.config.Quorum) {
-		got := len(r.intent.Endorsements)
-		r.logger.Info("RRR insufficient endorsers to become leader",
-			"q", int(r.config.Quorum), "got", got)
-		return false, nil
-	}
-
-	intentHash, err := r.codec.HashIntent(&r.intent.SI.Intent)
-	if err != nil {
-		return false, err
-	}
-
-	// Now check all the endorsments are for the intent
-	for _, end := range r.intent.Endorsements {
-		if intentHash != end.IntentHash {
-			return false, fmt.Errorf(
-				"endorsement intenthash mismatch. endid=%s", end.EndorserID.Hex())
-		}
-	}
-
-	r.logger.Info("RRR confirmed as leader",
-		"q", int(r.config.Quorum), "got", len(r.intent.Endorsements))
+// ** call with intentMu and pendingEnrolmentsMu held
+func (r *EndorsmentProtocol) sealCurrentBlock(beta, pi []byte, chain sealChainReader) error {
 
 	if r.sealTask == nil {
-		r.logger.Trace("RRR seal task canceled or discarded")
-		return false, nil
-	}
-
-	// The alpha here is always from the block we are building on, which is updated by refreshSealTask
-	beta, pi, err := r.vrf.Prove(r.privateKey, r.intent.Alpha)
-	if err != nil {
-		return false, fmt.Errorf("failed proving new seed: %v", err)
+		return fmt.Errorf("no sealTask to seal")
 	}
 
 	sealTimeBytes, err := time.Now().UTC().MarshalBinary()
 	if err != nil {
-		return false, fmt.Errorf("failed marshaling seal time: %v", err)
+		return fmt.Errorf("failed marshaling seal time: %v", err)
 	}
 	data := &SignedExtraData{
 		ExtraData: ExtraData{
@@ -357,7 +365,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 
 		u, err := r.codec.HashEnrolmentBinding(eb)
 		if err != nil {
-			return false, err
+			return err
 		}
 		r.codec.FillEnrolmentQuote(data.Enrol[i].Q[:], u, r.privateKey) // faux attestation
 		data.Enrol[i].U = u
@@ -369,7 +377,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 
 	seal, err := r.codec.EncodeSignExtraData(data, r.privateKey)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	r.sealTask.Committer.CommitSeal(seal)
@@ -377,5 +385,5 @@ func (r *EndorsmentProtocol) sealCurrentBlock(chain sealChainReader) (bool, erro
 	r.sealTask = nil
 	r.intent = nil
 
-	return true, nil
+	return nil
 }

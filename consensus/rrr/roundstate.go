@@ -129,6 +129,15 @@ type EndorsmentProtocol struct {
 	Number         uint64
 	FailedAttempts uint32
 
+	// Leaders need to automatically re-enrol if they are idle. At the end of
+	// the Confirm phase, if a leader candidate receives no endorsements at
+	// all, it will set this flag. The re-enrol message is then sent from the
+	// end of the broadcast phase. It is sent to all the freshly selected
+	// leaders to give the shortest possible latency on the re-enrolment and to
+	// ensure we send the enrolment to nodes we know to be live. The fallback
+	// is to send to the node that minted the last block.
+	reEnrolSelf bool
+
 	OnlineEndorsers map[Address]Peer
 
 	// These get updated each round on all nodes without regard to which are
@@ -262,14 +271,14 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 	}
 
 	if r.a != nil {
-		r.a.Prime(r.config.Activity, chain.CurrentHeader())
+		r.a.Prime(chain.CurrentHeader())
 		return nil
 	}
 
-	r.a = NewActiveSelection(r.codec, r.nodeID, r.logger)
+	r.a = NewActiveSelection(r.config, r.codec, r.nodeID, r.logger)
 
 	header := chain.CurrentHeader()
-	r.a.Reset(r.config.Activity, header)
+	r.a.Reset(header)
 
 	return nil
 }
@@ -287,13 +296,13 @@ func (r *EndorsmentProtocol) QueueEnrolment(et *EngEnrolIdentity) error {
 		// Round will be updated when we are ready to submit the enrolment. We
 		// record it here so we can keep track of how long enrolments have been
 		// queued.
-		Round: r.Number,
 		// Block hash filled in when we issue the intent containing this
 		// enrolment.
 
 		// XXX: ReEnrol flag is not necessary for non SGX implementations afaict.
 		ReEnrol: et.ReEnrol,
 	}
+	eb.Round = r.Number
 
 	r.pendingEnrolments[et.NodeID] = eb
 	return nil
@@ -329,32 +338,13 @@ func (r *EndorsmentProtocol) NewSignedIntent(et *EngSignedIntent) {
 }
 
 // handleIntent accepts the intent and queues it for endorsement if the
-// intendee is a candidate for the current round given the failedAttempts
-// provided on the intent.
+// intendee is a candidate for the current round.
 //  Our critical role here is to always select the *OLDEST* intent we see, and
 // to allow a 'fair' amount of time for intents to arrive before choosing one
-// to endorse. In a healthy network, there will be no failedAttempts, and we
-// could count on being synchronised reasonably with other nodes. In that
-// situation our local 'endorsing' state can be checked. In the unhealthy
-// scenario, or where the current leader candidates are all off line, we can
-// only progress if we re-sample. And in that scenario different nodes could
-// have been un-reachable for arbitrary amounts of time. So their
-// failedAttempts will be arbitrarily different. Further, we can't stop other
-// nodes from lying about their failedAttempts. So even if we were willing to
-// run through randome samples x failedAttempts to check, the result would be
-// meaningless - and would be an obvious way to DOS attack nodes.  Ultimately,
-// it is the job of VerifyHeader, on all honest nodes, to check that the
-// failedAttempts recorded in the block is consistent with the minters identity
-// and the endorsers the minter included.  Now we *could* do special things for
-// the firstAttempt or the first N attempts. But if, in the limit, we have to
-// be robust in the face of some endorsers not checking, I would like to start
-// with them all not checking
+// to endorse.
 func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 
 	var err error
-	// See RRR-spec.md for a more thorough explanation, and for why (for the
-	// blockclock model) we don't check the round phase or whether or not we -
-	// locally - have selected ourselves as an endorser.
 
 	// Do we agree that the intendee is next in line and that their intent is
 	// appropriate ?
@@ -440,12 +430,13 @@ func (r *EndorsmentProtocol) broadcastCurrentIntent(b Broadcaster) {
 	}
 
 	msg := r.intent.Msg
-	r.intentMu.Unlock()
 
 	if len(r.OnlineEndorsers) == 0 {
+		r.intentMu.Unlock()
 		return
 	}
 	err := b.Broadcast(r.nodeAddr, r.OnlineEndorsers, msg)
+	r.intentMu.Unlock()
 	if err != nil {
 		r.logger.Info("RRR BroadcastCurrentIntent - Broadcast", "err", err)
 	}

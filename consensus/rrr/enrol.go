@@ -108,3 +108,15 @@ func (codec *CipherCodec) RecoverEnrolerID(q Quote, u Hash) (Hash, error) {
 	copy(id[:], codec.c.Keccak256(p[1:65]))
 	return id, nil
 }
+
+func (r *EndorsmentProtocol) newEnrolIdentityMsg(nodeID Hash, reEnrol bool) (RMsg, error) {
+	ei := EngEnrolIdentity{NodeID: nodeID, ReEnrol: reEnrol}
+	raw, err := r.codec.EncodeToBytes(&ei)
+	rmsg := RMsg{}
+	if err != nil {
+		return rmsg, err
+	}
+	rmsg.Code = RMsgEnrol
+	rmsg.Raw = raw
+	return rmsg, nil
+}

@@ -353,7 +353,7 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 	switch rmsg.Code {
 	case RMsgIntent:
 
-		e.logger.Trace("RRR HandleMsg - post engSignedIntent")
+		e.logger.Trace("RRR HandleMsg - RMSgIntent")
 
 		si := &EngSignedIntent{ReceivedAt: time.Now(), Seq: rmsg.Seq}
 
@@ -370,16 +370,32 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 
 	case RMsgConfirm:
 
-		e.logger.Trace("RRR HandleMsg - post engSignedEndorsement")
+		e.logger.Trace("RRR HandleMsg - RMsgConfirm")
 		sc := &EngSignedEndorsement{ReceivedAt: time.Now(), Seq: rmsg.Seq}
 
 		if sc.Pub, err = e.codec.DecodeSignedEndorsement(&sc.SignedEndorsement, rmsg.Raw); err != nil {
 
-			e.logger.Debug("RRR Endorsement decodeverify failed", "err", err)
+			e.logger.Debug("RRR RMsgConfirm decodeverify failed", "err", err)
 			return true, err
 		}
 
 		e.PostIfRunning(sc)
+		return true, nil
+
+	case RMsgEnrol:
+
+		// Note: this is an enrolment request from another node. We support
+		// this so that idled leaders can automaticaly request renrol without
+		// going through the rpc. We will need to subjecti it to the same
+		// permissioning that we apply to enrolments coming from the rpc.
+		e.logger.Trace("RRR HandleMsg - post EngEnrolIdentity")
+		ei := EngEnrolIdentity{}
+		if err = e.codec.DecodeBytes(rmsg.Raw, &ei); err != nil {
+			e.logger.Debug("RRR MsgEnrol decode EngEnrolIdentity failed", "err", err)
+			return true, err
+		}
+
+		e.PostIfRunning(&ei)
 		return true, nil
 
 	default:

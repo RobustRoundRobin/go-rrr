@@ -426,14 +426,14 @@ func newNetwork(t *testing.T, numIdents int) *network {
 }
 
 func (net *network) newIntent(
-	idFrom int, parent rrr.BlockHeader, failedAttempts uint32) *rrr.Intent {
+	idFrom int, parent rrr.BlockHeader) *rrr.Intent {
 	key := net.id2key[idFrom]
 	require.NotZero(net.t, key)
 
 	roundNumber := big.NewInt(0)
 	roundNumber.Add(parent.GetNumber(), bigOne)
 	return fillIntent(
-		nil, net.ge.ChainID, key, parent, roundNumber, failedAttempts)
+		nil, net.ge.ChainID, key, parent, roundNumber)
 }
 
 func (net *network) endorseIntent(
@@ -517,7 +517,7 @@ func requireMakeSignedEndorsement(
 func fillIntent(
 	i *rrr.Intent,
 	chainID rrr.Hash, proposer *ecdsa.PrivateKey,
-	parent rrr.BlockHeader, roundNumber *big.Int, failedAttempts uint32) *rrr.Intent {
+	parent rrr.BlockHeader, roundNumber *big.Int) *rrr.Intent {
 
 	c := secp256k1suite.NewCipherSuite()
 
