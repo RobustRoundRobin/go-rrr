@@ -8,7 +8,6 @@ import (
 	"container/list"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"strings"
 )
@@ -18,7 +17,7 @@ var (
 	errGensisIdentitiesInvalid    = errors.New("identities in genesis extra are invalid or badly encoded")
 	errEnrolmentNotSignedBySealer = errors.New("identity enrolment was not indidualy signed by the block sealer")
 	ErrBranchDetected             = errors.New("branch detected")
-	errInsuficientActiveIdents    = errors.New("not enough active identities found")
+	errPermutationInvalidLength   = errors.New("permutation count must match ne (n endorsers)")
 	big0                          = big.NewInt(0)
 	zeroAddr                      = Address{}
 	zeroHash                      = Hash{}
@@ -48,7 +47,10 @@ type idActivity struct {
 	// ageBlock is the number of the block most recently minted by the
 	// identity OR the block the identity was enrolled on - udpated by
 	// esbalishAge
-	ageBlock *big.Int
+	ageBlock uint64
+
+	// ageRound is the round number the idenity was most recently active in - as per ageBlock
+	ageRound uint64
 
 	// endorsedHash is the hash of the block most recently endorsed by the
 	// identity
@@ -56,7 +58,10 @@ type idActivity struct {
 
 	// endorsedBlock is the number of the block most recently endorsed by the
 	// identity
-	endorsedBlock *big.Int
+	endorsedBlock uint64
+	// endorsedRound is the round number that produced the last block endorsed
+	// by the identity.
+	endorsedRound uint64
 
 	// oldestFor - the number of rounds the identity has been found to be the
 	// oldest. Reset only after the identity mints a block. Excludes inactive
@@ -76,40 +81,85 @@ type idActivity struct {
 	genesisOrder int
 }
 
-// ActiveSelection tracks the active identities and facilitates ordering them by
+// activeList tracks the active identities and facilitates ordering them by
 // age.
-type ActiveSelection struct {
-	codec *CipherCodec
+type activeList struct {
+	config *Config
+	codec  *CipherCodec
 
 	// activeSelection  is maintained in identity age order - with the youngest at
 	// the front.
 	activeSelection *list.List                // list of *idActive
 	aged            map[Address]*list.Element // map of NodeID.Addresss() -> Element in active
 
-	// The idle pool tracks identities that have gone idle within Ta*2-1 blocks
-	// from head at the time the node started. The *2-1 comes from the
-	// posibilty of seeing enrolments from nodes after their last
-	// (re-)enrolment has gone behond Ta of HEAD. Additionaly, because
-	// selectActive processes the chain from HEAD -> genesis, we can encounter
-	// endorsments before we see the enrolment. To accomodate this we put 'new'
-	// identity activity into the idlePool. Then IF we encounter the enrolment
-	// within Ta of HEAD we move it to the activeSelection
-	idlePool map[Address]*idActivity
+	// idleLeader stores the address of the leader removed by AccumulateActive
+	// due to being oldest to many times, or the zero address
+	idleLeader Hash
+
+	// Because AccumulateActive processes the chain from HEAD -> genesis, we can
+	// encounter endorsments before we see the enrolment. To accomodate this we
+	// put 'new' identity activity into the newPool. Then IF we encounter the
+	// enrolment within Ta of HEAD we move it to the activeSelection
+	newPool map[Address]*idActivity
 
 	// When updating activity, we walk back from the block we are presented
 	// with. We ERROR if we reach a block number lower than activeBlockFence
 	// without matching the hash - that is a branch and we haven't implemented
 	// SelectBranch yet.
 	lastBlockSeen    Hash
-	activeBlockFence *big.Int
+	activeBlockFence uint64
 
 	selfNodeID Hash // for logging only
 	logger     Logger
 }
 
+type ActiveSelection interface {
+
+	// AccumulateActive should be called each time a new block arrives to
+	// maintain the active selection of candidates and endorsers.
+	AccumulateActive(
+		chainID Hash, chain blockHeaderReader, head BlockHeader,
+	) error
+
+	// IdleLeader the zero address or the oldest identity removed by
+	// AccumulateActive due to being oldest for too long.When the number of
+	// active identities is below Nc +Ne this can impare the network. If it
+	// falls below Nc + Q, the network halts. To aoid this situation, leader
+	// candidates automatically re-enrol the address returned by this function
+	// if we have <= Nc+Ne active identities.
+	IdleLeader() Address
+
+	// SelectCandidatesAndEndorsers should be called once a round with a fresh
+	// permutation of indices into the active selection. There must be exactly
+	// nEndorsers worth of indices.
+	SelectCandidatesAndEndorsers(
+		permutation []int,
+	) (map[Address]bool, map[Address]bool, []Address, error)
+
+	// Reset resets and primes the active selection such that head - ta is the
+	// furthest back the next selection will look
+	Reset(head BlockHeader)
+
+	// Prime primes the active selection such that the next selection will look as
+	// far back as head - ta but no further
+	Prime(head BlockHeader)
+
+	YoungestNodeID() Hash
+
+	OldestNodeID() Hash
+
+	// AgeOf returns the age of the identity. The boolean return is false if the
+	// identity is not active.
+	AgeOf(nodeID Address) (uint64, bool)
+
+	NumActive() int
+	IsActive(addr Address) bool
+}
+
 func NewActiveSelection(
-	codec *CipherCodec, selfNodeID Hash, logger Logger) *ActiveSelection {
-	a := &ActiveSelection{
+	config *Config, codec *CipherCodec, selfNodeID Hash, logger Logger) ActiveSelection {
+	a := &activeList{
+		config:     config,
 		codec:      codec,
 		selfNodeID: selfNodeID,
 		logger:     logger,
@@ -119,40 +169,57 @@ func NewActiveSelection(
 
 // enumeration and access
 
-func (a *ActiveSelection) Len() int {
+func (a *activeList) NumActive() int {
 	return a.activeSelection.Len()
 }
 
-func (a *ActiveSelection) LenAged() int {
-	return len(a.aged)
+func (a *activeList) IdleLeader() Address {
+	return a.idleLeader.Address()
 }
 
-func (a *ActiveSelection) LenIdle() int {
-	return len(a.idlePool)
+func (a *activeList) IsActive(addr Address) bool {
+	_, ok := a.aged[addr]
+	return ok
 }
 
-func (a *ActiveSelection) YoungestNodeID() Hash {
+func (a *activeList) YoungestNodeID() Hash {
 
 	return a.activeSelection.Front().Value.(*idActivity).nodeID
 }
 
+func (a *activeList) OldestNodeID() Hash {
+
+	return a.activeSelection.Back().Value.(*idActivity).nodeID
+}
+
+// AgeOf returns the age of the identity or nil if it is not known
+func (a *activeList) AgeOf(nodeID Address) (uint64, bool) {
+	aged, ok := a.aged[nodeID]
+	if !ok {
+		return 0, false
+	}
+
+	// return a copy, it is just to error prone to do otherwise
+	return aged.Value.(*idActivity).ageBlock, true
+}
+
 // Reset resets and primes the active selection such that head - ta is the
 // furthest back the next selection will look
-func (a *ActiveSelection) Reset(activity uint64, head BlockHeader) {
+func (a *activeList) Reset(head BlockHeader) {
 
 	// It feels wrong to lean this much on garbage collection. But lets see how
 	// it goes.
-	a.idlePool = make(map[Address]*idActivity)
+	a.newPool = make(map[Address]*idActivity)
 	a.aged = make(map[Address]*list.Element)
 	a.lastBlockSeen = Hash{}
-	a.activeBlockFence = nil
+	a.activeBlockFence = 0
 	a.activeSelection = list.New()
-	a.Prime(activity, head)
+	a.Prime(head)
 }
 
 // Prime primes the active selection such that the next selection will look as
 // far back as head - ta but no further
-func (a *ActiveSelection) Prime(activity uint64, head BlockHeader) {
+func (a *activeList) Prime(head BlockHeader) {
 
 	// Note: block sync will stop the consensus. On re-start this will discard
 	// the current activeSelection. If we have a list (re-start) then we also
@@ -167,11 +234,14 @@ func (a *ActiveSelection) Prime(activity uint64, head BlockHeader) {
 	// selectCandidatesAndEndorsers
 
 	// horizon = head - activity
-	headNumber := big.NewInt(0).Set(head.GetNumber())
-	horizon := headNumber.Sub(headNumber, big.NewInt(int64(activity)))
-	if horizon.Cmp(big0) < 0 {
-		horizon.SetInt64(0)
+
+	horizon := uint64(0)
+	headNumber := head.GetNumber().Uint64()
+
+	if headNumber > a.config.Activity {
+		horizon = headNumber - a.config.Activity
 	}
+
 	a.activeBlockFence = horizon
 
 	// Notice that we _do not_ record the hash here, we leave that to
@@ -185,11 +255,9 @@ type blockHeaderReader interface {
 }
 
 // AccumulateActive is effectively SelectActive from the paper, but with the
-// 'obvious' caching optimisations. AND importantly we only add active
-// identities to the active set here, we do not cull idles. That is left to
-// selectCandidatesAndEndorsers.
-func (a *ActiveSelection) AccumulateActive(
-	chainID Hash, activity uint64, chain blockHeaderReader, head BlockHeader,
+// 'obvious' caching optimisations.
+func (a *activeList) AccumulateActive(
+	chainID Hash, chain blockHeaderReader, head BlockHeader,
 ) error {
 
 	var err error
@@ -202,9 +270,14 @@ func (a *ActiveSelection) AccumulateActive(
 		return nil
 	}
 
+	// ok, its a new block, reset idleLeader
+	a.idleLeader = Hash{}
+
 	blockActivity := BlockActivity{}
 
-	headNumber := head.GetNumber()
+	depth := uint64(0)
+	bigHeadNumber := head.GetNumber()
+	headNumber := bigHeadNumber.Uint64()
 	cur := head
 
 	youngestKnown := a.activeSelection.Front()
@@ -232,14 +305,25 @@ func (a *ActiveSelection) AccumulateActive(
 			break
 		}
 
+		var curRound uint64
+		if curRound, err = cur.GetRound(a.codec); err != nil {
+			return fmt.Errorf("bad seal, failed to decode: %w", err)
+		}
+
 		// If we have exceeded the Ta depth horizon we are done. Note we do this
 		// directly on the number in the header and the activity, rather than
 		// relying on the cached activeBlockFence.
-		curNumber := cur.GetNumber()
-		depth := new(big.Int).Sub(headNumber, curNumber)
+		curNumber := cur.GetNumber().Uint64()
+		depth = 0
+		if headNumber > curNumber {
+			depth = headNumber - curNumber
+		}
 
-		if !depth.IsUint64() || depth.Uint64() >= activity {
-			a.logger.Trace("RRR accumulateActive - complete, reached activity depth", "Ta", activity)
+		if depth >= a.config.Activity || curNumber > headNumber {
+			a.logger.Trace("RRR accumulateActive - complete, reached activity depth", "Ta", a.config.Activity)
+
+			// dump all identities whose last activity was before this block
+
 			break
 		}
 
@@ -247,7 +331,7 @@ func (a *ActiveSelection) AccumulateActive(
 		// the fence and we haven't matched the hash yet it means we have a
 		// chain re-org. The exception accommodates the first pass after node
 		// startup.
-		if a.lastBlockSeen != zeroHash && curNumber.Cmp(a.activeBlockFence) <= 0 && headNumber.Cmp(big0) != 0 {
+		if a.lastBlockSeen != zeroHash && curNumber <= a.activeBlockFence && headNumber != 0 {
 			// re-orgs are fine provided verifyBranch is working, but we can't
 			// deal with them sensibly here. The expectation is that everything
 			// in aged gets moved to idles then we re-run accumulateActive to
@@ -268,10 +352,10 @@ func (a *ActiveSelection) AccumulateActive(
 		a.enrolIdentities(
 			chainID, youngestKnown,
 			blockActivity.SealerID, blockActivity.SealerPub, blockActivity.Enrol,
-			h, hseal, curNumber)
+			h, hseal, curNumber, curRound)
 
 		// The sealer is the oldest of those identities active for this block and so is added last.
-		a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, 0)
+		a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, curRound, 0)
 
 		// The endorsers are active, they do not move in the age ordering.
 		// Note however, for any identity enrolled after genesis, as we are
@@ -283,7 +367,7 @@ func (a *ActiveSelection) AccumulateActive(
 		for _, end := range blockActivity.Confirm {
 			// xxx: should probably log when we see a confirmation for an
 			// enrolment we haven't had yet, that is 'interesting'
-			a.recordActivity(end.EndorserID, h, curNumber)
+			a.recordActivity(end.EndorserID, h, curNumber, curRound)
 		}
 
 		// a.logger.Trace("RRR accumulateActive - parent", "cur", cur.Hash(), "parent", cur.GetParentHash())
@@ -300,21 +384,64 @@ func (a *ActiveSelection) AccumulateActive(
 		}
 	}
 
+	// deal with idles
+	activeHorizon := uint64(0)
+	if headNumber > a.config.Activity {
+		activeHorizon = headNumber - a.config.Activity
+	}
+
+	// We always iterate oldest -> youngest
+	var next *list.Element
+	for cur, end := a.activeSelection.Back(), a.activeSelection.Front(); cur != end; cur = next {
+		next = cur.Prev()
+		age := cur.Value.(*idActivity)
+
+		// because we are going oldest to youngest we can break once we find an
+		// identity at or above the horizon.
+		if age.lastActiveBlock() >= activeHorizon {
+			break
+		}
+
+		a.logger.Trace("RRR ActiveSelection - identity fell below activity horizon",
+			"gi", age.genesisOrder, "end", age.endorsedBlock,
+			"last", age.lastActiveBlock(), "id", age.nodeID.Hex())
+
+		a.activeSelection.Remove(cur)
+		delete(a.aged, age.nodeID.Address())
+	}
+
+	Nc := int(a.config.Candidates)
+
+	oldest := a.activeSelection.Back().Value.(*idActivity)
+	if oldest.oldestFor > Nc && oldest.oldestFor > int(a.config.MinIdleAttempts) {
+
+		a.logger.Debug("RRR selectCandEs - droping unresponsive leader",
+			"nodeid", oldest.nodeID.Address().Hex(), "oldestFor", oldest.oldestFor)
+
+		a.activeSelection.Remove(a.activeSelection.Back())
+		delete(a.aged, oldest.nodeID.Address())
+
+		// If we are now Na <= Nc+Q+1 leaders are required to include this
+		// identity in there next block as an enrolment.
+		a.idleLeader = oldest.nodeID
+	}
+	oldest.oldestFor += 1
+
 	a.lastBlockSeen = headHash
-	a.activeBlockFence = big.NewInt(0).Set(headNumber)
+	a.activeBlockFence = headNumber
 
 	return nil
 }
 
-func (a *ActiveSelection) logSealerAge(cur BlockHeader, blockActivity *BlockActivity) {
+func (a *activeList) logSealerAge(cur BlockHeader, blockActivity *BlockActivity) {
 
 	a.logger.Debug("RRR accumulateActive - sealer",
 		"addr", a.logger.LazyValue(func() string { return blockActivity.SealerID.Address().HexShort() }),
 		"age", a.logger.LazyValue(func() string {
-			curNumber := cur.GetNumber()
+			curNumber := cur.GetNumber().Uint64()
 			if sealer := a.aged[blockActivity.SealerID.Address()]; sealer != nil {
 				age := sealer.Value.(*idActivity)
-				if age.ageBlock.Cmp(curNumber) < 0 {
+				if age.ageBlock < curNumber {
 					return fmt.Sprintf("%d->%d.%02d", age.ageBlock, curNumber, age.order)
 				}
 				return fmt.Sprintf("%05d.%02d", curNumber, age.order)
@@ -329,174 +456,125 @@ func (a *ActiveSelection) logSealerAge(cur BlockHeader, blockActivity *BlockActi
 	)
 }
 
-type randPerm func(int) []int
-
 // SelectCandidatesAndEndorsers determines if the current node is a leader
 // candidate and what the current endorsers are. The key requirement of RRR met
 // here  is that the results of this function should be the same on all nodes
 // assuming they run accumulateActive starting from the same `head' block. This
-// is both SelectCandidates and SelectEndorsers from the paper.
-func (a *ActiveSelection) SelectCandidatesAndEndorsers(
-	randPerm randPerm, nCandidates, nEndorsers, quorum, activityHorizon, failedAttempts uint,
+// is both SelectCandidates and SelectEndorsers from the paper. Notice: the
+// indices in the permutation are assumed to be sorted in ascending order.
+func (a *activeList) SelectCandidatesAndEndorsers(
+	permutation []int,
 ) (map[Address]bool, map[Address]bool, []Address, error) {
 
-	// Start with the oldest identity, and iterate towards the youngest. Move
-	// any inactive identities encountered to the idle set (this is the only
-	// place we remove 'inactive' entries from the active set). As we walk the
-	// active list We gather the candidates and the endorsers The candidates
-	// are the Nc first entries, the endorsers the Ne subsequent.
+	// Start with the oldest identity, and iterate towards the youngest. As we
+	// walk the active list We gather the candidates and the endorsers The
+	// candidates are the Nc first entries, the endorsers are picked using the
+	// `permuation`
 	//
-	// XXX: NOTICE: divergence (1) A node is a candidate OR an endorser but not
-	// both. The paper allows a candidate to also be an endorser. Discussion
-	// with the author suggests this divergence helps small networks without
-	// undermining the model.
+	// NOTICE: divergence (1) A node is a candidate OR an endorser but not both.
+	// The paper allows a candidate to also be an endorser. Discussion with the
+	// author suggests this divergence helps small networks without undermining
+	// the model.
 	//
-	// XXX: NOTICE: divergence (2) The paper specifies that the endorsers be
-	// sorted by public key to produce a stable ordering for selection. But we
-	// get a stable ordering by age naturally. So we use the permutation to
-	// pick the endorser entries by position in the age order sort of active
-	// identities. We can then eliminate the sort and also, usually, terminate
-	// the list scan early.
-	//
-	// XXX: NOTICE: divergence (4) If no block is produced in the configured
-	// time for intent+confirm, we re-sample. See RRR-spec.md Consensus Rounds
-	// for details. failedAttempts tracked the number of times the local node
-	// timer has expired withoug a block being produced.
+	// NOTICE: divergence (2) The paper specifies that the endorsers be sorted
+	// by public key to produce a stable ordering for selection. But we get a
+	// stable ordering by age naturally. So we use the permutation to pick the
+	// endorser entries by position in the age order sort of active identities.
+	// We can then eliminate the sort and also, usually, terminate the list scan
+	// early.
 
-	nActive := uint(a.activeSelection.Len())
-	if nActive < uint(nCandidates+quorum) {
+	Na := int(a.config.Activity)
+	Nc := int(a.config.Candidates)
+	Ne := int(a.config.Endorsers)
+
+	if len(permutation) != Ne {
 		return nil, nil, nil, fmt.Errorf(
-			"%v < %v(c) + %v(q), len(idle)=%v:%w", nActive, nCandidates, quorum, len(a.idlePool), errInsuficientActiveIdents)
+			"%d != %d: %w", len(permutation), Ne, errPermutationInvalidLength)
 	}
 
-	iFirstLeader, iLastLeader := a.calcLeaderWindow(nCandidates, nEndorsers, nActive, failedAttempts)
 	a.logger.Trace(
-		"RRR selectCandEs", "na", nActive, "agelen", len(a.aged), "idle", len(a.idlePool),
-		"f", failedAttempts, "if", iFirstLeader, "self", a.selfNodeID.Hex())
+		"RRR selectCandEs", "na", Na, "agelen", len(a.aged),
+		"self", a.selfNodeID.Address().Hex(), "selfID", a.selfNodeID.Hex())
 
 	candidates := make(map[Address]bool)
 	endorsers := make(map[Address]bool)
 
-	selection := make([]Address, 0, nCandidates+nEndorsers)
+	selection := make([]Address, 0, Ne+Nc)
 
 	var next *list.Element
+	var cur *list.Element
+	var end *list.Element // so that we can reset age rather than idle when there are <= Nc+Ne identities active
 
-	// The permutation is limited to active endorser candidate positions. The
-	// leader candidates don't consume 'positions'
-	pendingEndorserPositions := map[int]bool{}
-
-	// Get a random permutation of ALL active identities eligible as endorsers,
-	// then take the first e.config.Endorsers in that permutation. This gives
-	// us a random selection of endorsers with replacement.
-	permutation := randPerm(int(nActive) - int(nCandidates))
-	iend := nEndorsers
-	if uint(len(permutation)) < iend {
-		iend = uint(len(permutation))
-	}
-	permutation = permutation[:iend]
-	for _, r := range permutation {
-		pendingEndorserPositions[r] = true
-	}
-
-	// To apply the permutation *around* the leader window, we just add Nc to
-	// all endorser positions which are >= iFirstLeader
-
-	endorserPosition := 0
-	for cur, icur, inext := a.activeSelection.Back(), uint(0), uint(0); cur != nil; cur, icur = next, inext {
+	// Take the first nc
+	icur := 0
+	end = a.activeSelection.Front()
+	for cur = a.activeSelection.Back(); cur != end && len(candidates) < Nc; cur = next {
 
 		next = cur.Prev() // so we can remove, and yes, we are going 'backwards'
 
 		age := cur.Value.(*idActivity)
-
-		lastActive := age.lastActiveBlock()
-
-		if !a.withinActivityHorizon(activityHorizon, lastActive) {
-			a.logger.Trace("RRR selectCandEs - moving to idle set",
-				"gi", age.genesisOrder, "end", age.endorsedBlock, "last", a.activeBlockFence)
-
-			// don't consume the position
-			continue
-		}
-		inext++
-
 		addr := age.nodeID.Address()
 
-		// We are accumulating candidates and endorsers together. We stop once
-		// we have enough of *both* (or at the end of the list)
+		selection = append(selection, Address(addr)) // telemetry only
+		candidates[Address(addr)] = true
 
-		if icur >= iFirstLeader && icur <= iLastLeader &&
-			uint(len(candidates)) < nCandidates {
+		a.logger.Debug(
+			"RRR selectCandEs - select",
+			"cand", fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.genesisOrder),
+			"ic", len(candidates)-1, "a", age.lastActiveBlock())
+		// Note: divergence (1) leader candidates can not be endorsers
 
-			// A candidate that is oldest for Nc rounds is moved to the idle pool
-			if len(candidates) == 0 && failedAttempts == 0 {
-				// Note that we only increment oldestFor on the first attempt.
-				// It is a count of *rounds* that the identity has been oldest
-				// for. Age does not change with failedAttempts, and attempts
-				// are totaly un-coordinated
-				age.oldestFor++
-			}
+		icur++
+	}
 
-			// TODO: Complete the guard against unresponsive nodes, we can now
-			// that we have sorted out the relationship between blocks and
-			// rounds and attempts. But its a little tricky, it essentially
-			// involves moving the window.
-			if age.oldestFor > int(nCandidates) {
-				a.logger.Info("RRR selectCandEs - unresponsive node (droping tbd)",
-					"nodeid", age.nodeID.Address().Hex(), "oldestFor", age.oldestFor)
-			}
+	// The permutation is limited to active endorser positions. The leader
+	// candidates don't consume 'positions'. We assume the permutation is
+	// sorted ascending and just take them one after the other until all are
+	// consumed.
 
-			selection = append(selection, Address(addr)) // telemetry only
-			candidates[Address(addr)] = true
+	for ipermutation := 0; ipermutation < len(permutation) && cur != end; cur = next {
 
-			a.logger.Debug(
-				"RRR selectCandEs - select",
-				"cand", fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.genesisOrder),
-				"ic", len(candidates)-1, "a", lastActive)
-			continue
-			// Note: divergence (1) leader candidates can not be endorsers
-		}
-
-		// endorserPosition is the *index* into the random permutation, so
-		// there is nothing special to do here to account for the leader window
-		// - it just doesn't get advanced when we select a leader above.
+		next = cur.Prev() // so we can remove, and yes, we are going 'backwards'
+		age := cur.Value.(*idActivity)
+		addr := age.nodeID.Address()
 
 		// XXX: age < Te (created less than Te rounds) grinding attack mitigation
 
 		// divergence (2) instead of sorting the endorser candidates by address
 		// (public key) we rely on all nodes seeing the same 'age ordering',
 		// and select them by randomly chosen position in that ordering.
-		if pendingEndorserPositions[endorserPosition] {
 
-			a.logger.Debug(
-				"RRR selectCandEs - select", "endo",
-				fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.order),
-				"ie", endorserPosition, "a", lastActive)
-
-			endorsers[Address(addr)] = true
-			selection = append(selection, Address(addr)) // telemetry only
-			delete(pendingEndorserPositions, endorserPosition)
-
-			// If the leader window has moved all the way to the end, we can't
-			// break out early here.
-			if len(pendingEndorserPositions) == 0 && uint(nActive-1) < iLastLeader {
-				a.logger.Trace("RRR selectCandEs - early out", "n", a.activeSelection.Len(),
-					"e", len(candidates)+endorserPosition)
-				break // early out
-			}
+		// The permutation is just a random permutation of integers in the
+		// range [0, ne).
+		if permutation[ipermutation]+Nc != int(icur) {
+			icur++
+			continue
 		}
-		endorserPosition++ // endorserPosition advances for all active endorsers
+		icur++
+		ipermutation++
+
+		a.logger.Debug(
+			"RRR selectCandEs - select", "endo",
+			fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.order),
+			"ie", icur, "a", age.lastActiveBlock())
+
+		endorsers[Address(addr)] = true
+		selection = append(selection, Address(addr)) // telemetry only
 	}
 
-	a.logSelection(candidates, endorsers, selection, nCandidates, nEndorsers)
+	a.logSelection(candidates, endorsers, selection, Nc, Ne)
 
 	a.logger.Debug("RRR selectCandEs - iendorsers", "p", permutation)
+	if len(selection)-Nc == 0 {
+		a.logger.Info("RRR selectCandEs - no endorsers selected")
+	}
 
 	return candidates, endorsers, selection, nil
 }
 
-func (a *ActiveSelection) logSelection(
+func (a *activeList) logSelection(
 	candidates map[Address]bool, endorsers map[Address]bool,
-	selection []Address, nCandidates, nEndorsers uint) {
+	selection []Address, nCandidates, nEndorsers int) {
 
 	a.logger.Debug("RRR selectCandEs selected", "", a.logger.LazyValue(
 		func() string {
@@ -536,56 +614,26 @@ func (a *ActiveSelection) logSelection(
 	)
 }
 
-// LeaderForRoundAttempt determines if the provided identity was selected as
-// leader for the current round given the provided failedAttempts
-func (a *ActiveSelection) LeaderForRoundAttempt(
-	nCandidates, nEndorsers uint, id Address, failedAttempts uint) bool {
-
-	nActive := uint(a.activeSelection.Len())
-	iFirstLeader, iLastLeader := a.calcLeaderWindow(
-		nCandidates, nEndorsers, nActive, failedAttempts)
-
-	if iFirstLeader >= uint(a.activeSelection.Len()) {
-		a.logger.Trace(
-			"RRR leaderForRoundAttempt - if out of range",
-			"if", iFirstLeader, "len", a.activeSelection.Len())
-		return false
-	}
-
-	cur, icur := a.activeSelection.Back(), uint(0)
-	for ; cur != nil && icur <= iLastLeader; cur, icur = cur.Prev(), icur+1 {
-		if icur < iFirstLeader {
-			continue
-		}
-		if cur.Value.(*idActivity).nodeID.Address() == id {
-			return true
-		}
-	}
-	return false
-}
-
 // lastActiveBlock returns the higher of endorsedBlock and ageBlock
-func (a *idActivity) lastActiveBlock() *big.Int {
+func (a *idActivity) lastActiveBlock() uint64 {
 
-	if a.endorsedBlock.Cmp(a.ageBlock) > 0 {
+	if a.endorsedBlock > a.ageBlock {
 		return a.endorsedBlock
 	}
 	return a.ageBlock
 }
 
-func (a *ActiveSelection) enrolIdentities(
+func (a *activeList) enrolIdentities(
 	chainID Hash, fence *list.Element, sealerID Hash,
-	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, number *big.Int,
+	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, blockNumber, roundNumber uint64,
 ) error {
 
-	enbind := &EnrolmentBinding{
-		Round: big.NewInt(0),
-	}
+	enbind := EnrolmentBinding{}
 
 	// Gensis block can't refer to itself
-	if number.Cmp(big0) > 0 {
+	if roundNumber > 0 {
 		enbind.ChainID = chainID
-		enbind.Round.Set(number)
+		enbind.Round = roundNumber
 		enbind.BlockHash = blockSeal
 	}
 
@@ -594,14 +642,13 @@ func (a *ActiveSelection) enrolIdentities(
 		enbind.NodeID = e.ID
 		enbind.ReEnrol = reEnrol
 
-		u, err := a.codec.HashEnrolmentBinding(enbind)
+		u, err := a.codec.HashEnrolmentBinding(&enbind)
 		if err != nil {
 			return false, err
 		}
 		if u != e.U {
 			// We try with and without re-enrolment set, so hash match isn't an
 			// error
-			a.logger.Debug("RRR enrolIdentities - u != e.U", "u", u.Hex(), "e.U", e.U.Hex())
 			return false, nil
 		}
 
@@ -652,12 +699,12 @@ func (a *ActiveSelection) enrolIdentities(
 		if sealerID == enr.ID {
 			a.logger.Trace(
 				"RRR enrolIdentities - sealer found in enrolments",
-				"bn", number, "#", block.Hex())
+				"bn", blockNumber, "r", roundNumber, "#", block.Hex())
 			continue
 		}
-		a.logger.Info("RRR enroled identity", "id", enr.ID.Hex(), "bn", number, "#", block.Hex())
+		a.logger.Info("RRR enroled identity", "id", enr.ID.Hex(), "bn", blockNumber, "r", roundNumber, "#", block.Hex())
 
-		a.refreshAge(fence, enr.ID, block, number, order)
+		a.refreshAge(fence, enr.ID, block, blockNumber, roundNumber, order)
 	}
 	return nil
 }
@@ -665,14 +712,14 @@ func (a *ActiveSelection) enrolIdentities(
 func newIDActivity(nodeID Hash) *idActivity {
 	return &idActivity{
 		nodeID:        nodeID,
-		ageBlock:      big.NewInt(0),
-		endorsedBlock: big.NewInt(0),
+		ageBlock:      0,
+		endorsedBlock: 0,
 	}
 }
 
 // recordActivity is called for a node to indicate it is active in the current
-// round. Inactive entries are culled by selectCandidatesAndEndorsers
-func (a *ActiveSelection) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big.Int) *idActivity {
+// round.
+func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber, roundNumber uint64) *idActivity {
 
 	var aged *idActivity
 	nodeAddr := nodeID.Address()
@@ -688,28 +735,27 @@ func (a *ActiveSelection) recordActivity(nodeID Hash, endorsed Hash, blockNumber
 		// encountered within HEAD - Ta
 
 		aged = newIDActivity(nodeID)
-		a.idlePool[nodeAddr] = aged
+		a.newPool[nodeAddr] = aged
 	}
 	aged.endorsedHash = endorsed
-	aged.endorsedBlock.Set(blockNumber)
+	aged.endorsedBlock = blockNumber
+	aged.endorsedRound = roundNumber
 
 	return aged
 }
 
 // refreshAge called to indicate that nodeID has minted a block or been
 // enrolled. If this is the youngest block minted by the identity, we move its
-// entry after the fence.  Counter intuitively, we always insert the at the
-// 'oldest' position after the fence. Because accumulateActive works from the
-// head (youngest) towards genesis we are visiting from the youngest to the
-// oldest. By always inserting after the youngest that was in the list when we
-// started, we preserve that order. In the special case where the list starts
-// empty the fence is nil. In this case to preserve the order we *PushBack* -
-// the first identity we add will be left at the *youngest* position.
-// enrolIdentities is careful to processe enrolments for a block in reverse
-// order of age. Taken all together, this give us an efficient way to always
-// have identities sorted in age order.
-func (a *ActiveSelection) refreshAge(
-	fence *list.Element, nodeID Hash, block Hash, blockNumber *big.Int, order int,
+// entry to the oldest position which is younger than the fence. The fence is
+// the youngest known when we start the accumulate active process.
+// Because accumulateActive works from the head (youngest) towards genesis we
+// are visiting from the youngest to the oldest. By always inserting at the
+// oldest position younger than the fence, we preserve that order.  In the
+// special case where the list starts empty the fence is nil. In this case to
+// preserve the order we just need to PushBack, each identity encountered is
+// 'older' than the previous
+func (a *activeList) refreshAge(
+	fence *list.Element, nodeID Hash, block Hash, blockNumber, roundNumber uint64, order int,
 ) {
 	var aged *idActivity
 
@@ -723,20 +769,21 @@ func (a *ActiveSelection) refreshAge(
 		// have already processed it and it is in the appropriate place.
 		// But note if we have a re-org, ageBlock *can* be from the 'other'
 		// branch and so > head. The aged pool needs to be re-set for a re-org.
-		if aged.ageBlock.Cmp(blockNumber) <= 0 {
+		if aged.ageBlock <= blockNumber {
 
 			a.logger.Trace("RRR refreshAge - move",
 				"fenced", bool(fence != nil), "addr", nodeAddr.HexShort(), "age",
 				fmt.Sprintf("%d->%d.%02d", aged.ageBlock, blockNumber, order))
 
 			if fence != nil {
-				// Note: 'Before' means *in front of*
+				// Note: 'Before' means *in front of* (younger position)
 				a.activeSelection.MoveBefore(el, fence)
 			} else {
 				// Here we are assuming the list started *empty*
 				a.activeSelection.MoveToBack(el)
 			}
-			aged.ageBlock.Set(blockNumber)
+			aged.ageBlock = blockNumber
+			aged.ageRound = roundNumber
 			aged.ageHash = block
 			aged.oldestFor = 0
 			aged.order = order
@@ -747,7 +794,7 @@ func (a *ActiveSelection) refreshAge(
 		// If it was enrolled within HEAD - Ta and has been active, it will be
 		// in the idle pool because the age wasn't known when the activity was
 		// seen by recordActivity. In either event there is no previous age.
-		if aged = a.idlePool[nodeAddr]; aged != nil {
+		if aged = a.newPool[nodeAddr]; aged != nil {
 			a.logger.Trace(
 				"RRR refreshAge - from idle", "addr", nodeAddr.HexShort(),
 				"age", fmt.Sprintf("%05d.%02d", blockNumber, order))
@@ -757,21 +804,21 @@ func (a *ActiveSelection) refreshAge(
 				fmt.Sprintf("%05d.%02d", blockNumber, order))
 			aged = newIDActivity(nodeID)
 		}
-		delete(a.idlePool, nodeAddr)
+		delete(a.newPool, nodeAddr)
 
-		aged.ageBlock.Set(blockNumber)
+		aged.ageBlock = blockNumber
+		aged.ageRound = roundNumber
 		aged.ageHash = block
 		aged.oldestFor = 0
 		aged.order = order
 
 		if fence != nil {
-			// Note: 'Before' means *in front of*
+			// Note: 'Before' means *in front of* (younger position)
 			a.aged[nodeAddr] = a.activeSelection.InsertBefore(aged, fence)
 		} else {
 			// Here we are assuming the list started *empty*
 			a.aged[nodeAddr] = a.activeSelection.PushBack(aged)
 		}
-
 	}
 
 	// Setting ageBlock resets the age of the identity. The test for active is
@@ -779,52 +826,9 @@ func (a *ActiveSelection) refreshAge(
 	// then it is still considered 'active' if ageBlock is inside Ta.
 	// Re-enrolment is how the current leader re-activates idle identities.
 
-	if blockNumber.Cmp(big0) == 0 {
+	if blockNumber == 0 {
 		aged.genesisOrder = order
 	}
-}
-
-// Is the number within Ta blocks of the block head ?
-func (a *ActiveSelection) withinActivityHorizon(activity uint, blockNumber *big.Int) bool {
-
-	// Note that activeBlockFence is intialised to the head block in Start
-
-	// depth = activeBlockFence - blockNumber
-	depth := big.NewInt(0).Set(a.activeBlockFence)
-	depth.Sub(depth, blockNumber)
-	if !depth.IsUint64() {
-		// blockNumber is *higher* than our activity fence. blockNumber
-		// typically comes from an age record, which would imply we have a
-		// block extra data with an endorsement for a higher block number than
-		// itself, which is clearly invalid - we have to see the block in order
-		// that it gets into the age cache
-		a.logger.Trace(
-			"RRR withinActivityHorizon - future block",
-			"Ta", activity, "bn", blockNumber, "last", a.activeBlockFence)
-		return false
-	}
-	if depth.Uint64() > uint64(activity) {
-		return false
-	}
-	return true
-}
-
-func (a *ActiveSelection) calcLeaderWindow(
-	nCandidates, nEndorsers, nActive, failedAttempts uint) (uint, uint) {
-
-	// a = active mod  [ MAX (n active, Nc + Ne) ]
-	na := float64(nActive)
-	nc, ne := float64(nCandidates), float64(nEndorsers)
-	max := math.Max(na, nc+ne)
-	amod, _ := math.Modf(math.Mod(float64(failedAttempts), max))
-
-	iFirstLeader := uint(math.Floor(amod/nc) * nc)
-	iLastLeader := iFirstLeader + nCandidates - 1
-
-	a.logger.Trace(
-		"RRR calcLeaderWindow", "na", na, "f", failedAttempts, "nc+ne", nc+ne,
-		"max", max, "a", amod, "if", iFirstLeader)
-	return iFirstLeader, iLastLeader
 }
 
 // The cursor arrangement only exists to support testing
@@ -844,8 +848,12 @@ type ActivityCursor interface {
 // NewActiveSelectionCursor creates a cursor over the active selection. This is
 // provided to facilitate testing from external packages. It may get withdrawn
 // without notice.
-func NewActiveSelectionCursor(a *ActiveSelection) ActivityCursor {
-	cur := &selectionCursor{selection: a.activeSelection}
+func NewActiveSelectionCursor(a ActiveSelection) ActivityCursor {
+
+	al := a.(*activeList) // will panic if a is not an activeList
+
+	// activeList
+	cur := &selectionCursor{selection: al.activeSelection}
 	return cur
 }
 

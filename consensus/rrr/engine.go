@@ -12,14 +12,12 @@ import (
 )
 
 var (
-	ErrConfirmPhaseToLarge     = errors.New("confirm phase can not be longer than the round")
-	ErrIncompatibleChainReader = errors.New("chainreader missing required interfaces for RRR")
-	ErrNoGenesisHeader         = errors.New("failed to get genesis header")
-	ErrNotLeaderCandidate      = errors.New("expected to be leader candidate")
-	ErrEngineStopped           = errors.New("consensus not running")
-	ErrRMsgInvalidCode         = errors.New("recevived RMsg with invalid code")
-
-	bigOne = big.NewInt(1)
+	ErrIntentAndConfirmPhaseToLarge = errors.New("intent + confirm phase can not be longer than the round")
+	ErrIncompatibleChainReader      = errors.New("chainreader missing required interfaces for RRR")
+	ErrNoGenesisHeader              = errors.New("failed to get genesis header")
+	ErrNotLeaderCandidate           = errors.New("expected to be leader candidate")
+	ErrEngineStopped                = errors.New("consensus not running")
+	ErrRMsgInvalidCode              = errors.New("recevived RMsg with invalid code")
 
 	// Difficulty is the measure of 'how hard' it is to extend the chain. For
 	// PoA, and RRR in particular, this is just an indicator of whose turn it
@@ -70,12 +68,14 @@ type Broadcaster interface {
 // Engine implements consensus.Engine using Robust Round Robin consensus
 // https://arxiv.org/abs/1804.07391
 type Engine struct {
-	codec *CipherCodec
+	*EndorsmentProtocol
 
 	// Don't change these while the engine is running
-	config     *Config
 	privateKey *ecdsa.PrivateKey
-	logger     Logger
+
+	// If set, called when candidates fail there round attempt. It is expected
+	// to check for clock drift and take appropriate action (ie log a warning)
+	clockChecker func()
 
 	peerFinder PeerFinder
 
@@ -98,8 +98,6 @@ type Engine struct {
 	// The run method assumes the ownership of all values sent to this channel.
 	// Handles all of the  eng* types and core.ChainHeadEvent
 	runningCh chan interface{}
-
-	r *EndorsmentProtocol
 }
 
 func (e *Engine) RunLock() {
@@ -111,23 +109,23 @@ func (e *Engine) RunUnlock() {
 }
 
 func (e *Engine) NodeID() Hash {
-	return e.r.nodeID
+	return e.nodeID
 }
 
 // ChainID is the chain identifier. Will return the zero hash until Start is
 // called.
 func (e *Engine) ChainID() Hash {
-	return e.r.genesisEx.ChainID
+	return e.genesisEx.ChainID
 }
 
 // NodeAddress returns the node address
 func (e *Engine) NodeAddress() Address {
-	return e.r.nodeAddr
+	return e.nodeAddr
 }
 
 // NodePublic returns the marshaled public key. (uncompressed form specified in section 4.3.6 of ANSI X9.62)
 func (e *Engine) NodePublic() []byte {
-	return PubMarshal(e.codec.c, &e.r.privateKey.PublicKey)
+	return PubMarshal(e.codec.c, &e.privateKey.PublicKey)
 }
 
 // IsRunning returns true if the engine is still running
@@ -138,17 +136,27 @@ func (e *Engine) IsRunning() bool {
 }
 
 func (e *Engine) IsEnrolmentPending(nodeID [32]byte) bool {
-	return e.r.IsEnrolmentPending(nodeID)
+	return e.EndorsmentProtocol.IsEnrolmentPending(nodeID)
 }
 
-// ConfigureNew a new instance of the rrr consensus engine. Assumes the provided
+type EngineOption func(e *Engine)
+
+func WithClockCheck(checker func()) EngineOption {
+	return func(e *Engine) {
+		e.clockChecker = checker
+	}
+}
+
+// NewEngine a new instance of the rrr consensus engine. Assumes the provided
 // engine instance is new.
 func NewEngine(
 	config *Config, codec *CipherCodec,
-	privateKey *ecdsa.PrivateKey, logger Logger) (*Engine, error) {
+	privateKey *ecdsa.PrivateKey, logger Logger, opts ...EngineOption) (*Engine, error) {
 
-	if config.ConfirmPhase > config.RoundLength {
-		return nil, fmt.Errorf("confirm=%v, round=%v: %w", config.ConfirmPhase, config.RoundLength, ErrConfirmPhaseToLarge)
+	if (config.IntentPhase + config.ConfirmPhase) >= config.RoundLength {
+		return nil, fmt.Errorf(
+			"i=%v, c=%v, round=%v: %w",
+			config.IntentPhase, config.ConfirmPhase, config.RoundLength, ErrIntentAndConfirmPhaseToLarge)
 	}
 
 	// Only get err from NewRC if zize requested is <=0
@@ -162,14 +170,16 @@ func NewEngine(
 	}
 
 	e := &Engine{
-		config:       config,
-		codec:        codec,
-		privateKey:   privateKey,
-		logger:       logger,
-		r:            NewRoundState(codec, privateKey, config, logger),
-		peerMessages: peerMessages,
-		selfMessages: selfMessages,
+		privateKey:         privateKey,
+		EndorsmentProtocol: NewRoundState(codec, privateKey, config, logger),
+		peerMessages:       peerMessages,
+		selfMessages:       selfMessages,
 	}
+
+	for _, o := range opts {
+		o(e)
+	}
+
 	return e, nil
 }
 
@@ -194,7 +204,7 @@ func (e *Engine) Start(
 	// IF we are starting for the first time or the active selection has been
 	// thrown away, this will re initialise it. else we are re-starting,
 	// and accumulateActive will catch up as appropriate for the new head
-	if err := e.r.PrimeActiveSelection(chain); err != nil {
+	if err := e.PrimeActiveSelection(chain); err != nil {
 		return err
 	}
 
@@ -235,7 +245,7 @@ func (e *Engine) run(chain EngineChainReader, ch <-chan interface{}) {
 	e.runningWG.Add(1)
 
 	// Sort out the initial state and kick of the ticker.
-	e.r.StartRounds(e, chain)
+	e.StartRounds(e, chain)
 
 	// Endorsed leader candidates will broadcast the new block at the end of
 	// the round according to their tickers. We reset the ticker each time we
@@ -258,22 +268,22 @@ func (e *Engine) run(chain EngineChainReader, ch <-chan interface{}) {
 
 			case *EngNewChainHead:
 
-				e.r.NewChainHead(e, chain, et.BlockHeader)
+				e.NewChainHead(e, chain, et.BlockHeader)
 
 			// new work from the miner
 			case *EngSealTask:
 
-				e.r.NewSealTask(e, et)
+				e.NewSealTask(e, et)
 
 			// Consensus protocol: a leaders signed intent to produce a block
 			case *EngSignedIntent:
 
-				e.r.NewSignedIntent(et)
+				e.NewSignedIntent(et)
 
 			// Consensus protocol: endorsers responding to a leaders intent
 			case *EngSignedEndorsement:
 
-				e.r.NewSignedEndorsement(et)
+				e.NewSignedEndorsement(et)
 
 			// enrolment of new identities post genesis. XXX: TODO make this (at
 			// least) respect --permissioned and permissioned-nodes.json. Longer
@@ -281,15 +291,15 @@ func (e *Engine) run(chain EngineChainReader, ch <-chan interface{}) {
 			// paper.
 			case *EngEnrolIdentity:
 
-				e.r.QueueEnrolment(et)
+				e.QueueEnrolment(et)
 
 			default:
 				e.logger.Info("rrr engine.run received unknown type", "v", i)
 			}
 
-		case <-e.r.T.Ticker.C:
+		case <-e.T.Ticker.C:
 
-			e.r.PhaseTick(e, chain)
+			e.PhaseTick(e, chain)
 		}
 	}
 }
@@ -321,7 +331,7 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 	switch rmsg.Code {
 	case RMsgIntent:
 
-		e.logger.Trace("RRR HandleMsg - post engSignedIntent")
+		e.logger.Trace("RRR HandleMsg - RMSgIntent")
 
 		si := &EngSignedIntent{ReceivedAt: time.Now(), Seq: rmsg.Seq}
 
@@ -338,16 +348,32 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 
 	case RMsgConfirm:
 
-		e.logger.Trace("RRR HandleMsg - post engSignedEndorsement")
+		e.logger.Trace("RRR HandleMsg - RMsgConfirm")
 		sc := &EngSignedEndorsement{ReceivedAt: time.Now(), Seq: rmsg.Seq}
 
 		if sc.Pub, err = e.codec.DecodeSignedEndorsement(&sc.SignedEndorsement, rmsg.Raw); err != nil {
 
-			e.logger.Debug("RRR Endorsement decodeverify failed", "err", err)
+			e.logger.Debug("RRR RMsgConfirm decodeverify failed", "err", err)
 			return true, err
 		}
 
 		e.PostIfRunning(sc)
+		return true, nil
+
+	case RMsgEnrol:
+
+		// Note: this is an enrolment request from another node. We support
+		// this so that idled leaders can automaticaly request renrol without
+		// going through the rpc. We will need to subjecti it to the same
+		// permissioning that we apply to enrolments coming from the rpc.
+		e.logger.Trace("RRR HandleMsg - post EngEnrolIdentity")
+		ei := EngEnrolIdentity{}
+		if err = e.codec.DecodeBytes(rmsg.Raw, &ei); err != nil {
+			e.logger.Debug("RRR MsgEnrol decode EngEnrolIdentity failed", "err", err)
+			return true, err
+		}
+
+		e.PostIfRunning(&ei)
 		return true, nil
 
 	default:
@@ -437,8 +463,8 @@ func (e *Engine) SendSignedEndorsement(intenderAddr Address, et *EngSignedIntent
 
 	c := &SignedEndorsement{
 		Endorsement: Endorsement{
-			ChainID:    e.r.genesisEx.ChainID,
-			EndorserID: e.r.nodeID,
+			ChainID:    e.genesisEx.ChainID,
+			EndorserID: e.nodeID,
 		},
 	}
 
@@ -466,7 +492,7 @@ func (e *Engine) SendSignedEndorsement(intenderAddr Address, et *EngSignedIntent
 
 	e.logger.Debug("RRR sending confirmation",
 		"candidate", et.SignedIntent.NodeID.Hex(),
-		"endorser", e.r.nodeID.Hex())
+		"endorser", e.nodeID.Hex())
 
 	// find the peer candidate
 	return e.Send(intenderAddr, msg)
@@ -537,25 +563,25 @@ func (e *Engine) SetPeerFinder(f PeerFinder) {
 // that a new block should have. For rrr this is just the round number
 func (e *Engine) CalcDifficulty(chain interface{}, time uint64, parent BlockHeader) *big.Int {
 	e.logger.Trace("RRR CalcDifficulty")
-	return e.r.CalcDifficulty(e.r.nodeAddr)
+	return e.EndorsmentProtocol.CalcDifficulty(e.nodeAddr)
 }
 
 func (e *Engine) VerifySeal(chain VerifyBranchChainReader, header BlockHeader) error {
 
-	if _, err := e.r.VerifyHeader(chain, header); err != nil {
+	if _, err := e.EndorsmentProtocol.VerifyHeader(chain, header); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (e *Engine) VerifyHeader(chain headerByNumberChainReader, header BlockHeader) error {
-	_, err := e.r.VerifyHeader(chain, header)
+func (e *Engine) VerifyHeader(chain headerByHashChainReader, header BlockHeader) error {
+	_, err := e.EndorsmentProtocol.VerifyHeader(chain, header)
 	return err
 }
 
 func (e *Engine) VerifyBranchHeaders(
 	chain VerifyBranchChainReader, header BlockHeader, parents []BlockHeader) error {
-	return e.r.VerifyBranchHeaders(chain, header, parents)
+	return e.EndorsmentProtocol.VerifyBranchHeaders(chain, header, parents)
 }
 
 // Author retrieves the Ethereum address of the account that minted the given
@@ -570,10 +596,10 @@ func (e *Engine) Author(header BlockHeader) (Address, error) {
 
 	sealingNodeAddr := sealerID.Address()
 
-	if sealingNodeAddr == e.r.nodeAddr {
-		e.logger.Debug("RRR Author - sealed by self", "addr", sealingNodeAddr, "bn", header.GetNumber())
+	if sealingNodeAddr == e.nodeAddr {
+		e.logger.Debug("RRR Author - sealed by self", "addr", sealingNodeAddr.Hex(), "bn", header.GetNumber())
 	} else {
-		e.logger.Debug("RRR Author sealed by", "addr", sealingNodeAddr, "bn", header.GetNumber())
+		e.logger.Debug("RRR Author sealed by", "addr", sealingNodeAddr.Hex(), "bn", header.GetNumber())
 	}
 	return sealingNodeAddr, nil
 }

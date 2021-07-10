@@ -50,7 +50,7 @@ func (codec *CipherCodec) DecodeBlockActivity(a *BlockActivity, chainID Hash, he
 	// Get the genesis signer public key and node id. Do this derivation of
 	// node id and public key unconditionally regardless of wheter we think we
 	// have the information to hand - it is just safer that way.
-	a.SealerPub, err = codec.c.Ecrecover(ge.IdentInit[0].U[:], ge.IdentInit[0].Q[:])
+	a.SealerPub, err = codec.c.Ecrecover(ge.Enrol[0].U[:], ge.Enrol[0].Q[:])
 	if err != nil {
 		return fmt.Errorf("%v:%w", err, errGensisIdentitiesInvalid)
 	}
@@ -58,7 +58,7 @@ func (codec *CipherCodec) DecodeBlockActivity(a *BlockActivity, chainID Hash, he
 	copy(a.SealerID[:], codec.c.Keccak256(a.SealerPub[1:65]))
 
 	a.Confirm = []Endorsement{}
-	a.Enrol = ge.IdentInit
+	a.Enrol = ge.Enrol
 
 	return nil
 }

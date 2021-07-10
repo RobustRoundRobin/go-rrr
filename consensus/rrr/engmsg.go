@@ -20,6 +20,10 @@ const (
 	// RMsgConfirm identifies RRR endorsement messages (confirmations)
 	RMsgConfirm
 
+	// RMsgEnrol is used to alow nodes to self enrol and automatically re-enrol
+	// without needing to go through the rpc mechanism
+	RMsgEnrol
+
 	// RMsgRandContribSolicit ...
 	RMsgRandContribSolicit
 	// RMsgRandContrib ...

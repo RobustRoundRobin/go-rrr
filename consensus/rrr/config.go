@@ -2,6 +2,7 @@ package rrr
 
 // Config carries the RRR consensus configuration
 type Config struct {
+	IntentPhase  uint64 `toml:",omitempty"` // How long endorsers wait to decide the oldes leader
 	ConfirmPhase uint64 `toml:",omitempty"` // Duration of the confirmation phase in milliseconds (must be < round)
 	RoundLength  uint64 `toml:",omitempty"` // Duration of each round in milliseconds
 
@@ -10,15 +11,22 @@ type Config struct {
 	Quorum            uint64 `toml:",omitempty"` // Number of endorsments required to confirm an intent
 	Activity          uint64 `toml:",omitempty"` // Activity threshold (Ta) (in blocks). Any identity with confirmation messages recorded within this many rounds of the head are considered active.
 	StablePrefixDepth uint64 `toml:"omitempty"`  // d stable block prefix (for seed r-d)
+
+	// MinIdleAttempts if the identity is oldest for
+	// MAX(Candidates,MinIdleAttempts) it is made idle. Used to avoid over
+	// agressive idling in small networks.
+	MinIdleAttempts uint64 `toml:"omitempty"`
 }
 
 // DefaultConfig provides the default rrr consensus configuration
 var DefaultConfig = &Config{
-	ConfirmPhase:      5000,
-	RoundLength:       6000,
-	Candidates:        5,
-	Endorsers:         100,
-	Quorum:            54,
+	IntentPhase:       1000,
+	ConfirmPhase:      1000,
+	RoundLength:       4000,
+	Candidates:        2,
+	Endorsers:         7,
+	Quorum:            4,
 	Activity:          200,
-	StablePrefixDepth: 12,
+	StablePrefixDepth: 6,
+	MinIdleAttempts:   5,
 }

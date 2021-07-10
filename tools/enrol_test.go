@@ -20,11 +20,11 @@ func TestRoundTripChainID(t *testing.T) {
 
 	extra1 := &rrr.GenesisExtraData{
 		ChainInit: rrr.ChainInit{
-			IdentInit: []rrr.Enrolment{
-				{Q: rrr.Quote{8, 9}, U: rrr.Hash{10, 11}},
+			ExtraHeader: rrr.ExtraHeader{
+				Seed:  []byte{0, 1, 2, 3},
+				Proof: []byte{4, 5, 6, 7},
+				Enrol: []rrr.Enrolment{{Q: rrr.Quote{8, 9}, U: rrr.Hash{10, 11}}},
 			},
-			Seed:  []byte{0, 1, 2, 3},
-			Proof: []byte{4, 5, 6, 7},
 		},
 	}
 
@@ -45,6 +45,6 @@ func TestRoundTripChainID(t *testing.T) {
 	require.Nil(err)
 
 	require.Equal(extra3.ChainID, extra2.ChainID, "extra data encoding  of chainid is incorrect")
-	require.Equal(extra1.IdentInit[0], extra2.IdentInit[0])
-	require.Equal(extra1.IdentInit[0], extra3.IdentInit[0])
+	require.Equal(extra1.Enrol[0], extra2.Enrol[0])
+	require.Equal(extra1.Enrol[0], extra3.Enrol[0])
 }

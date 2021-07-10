@@ -2,7 +2,6 @@ package rrr
 
 import (
 	"crypto/ecdsa"
-	"math/big"
 )
 
 // Intent declares a leader candidates intent to seal a block
@@ -12,12 +11,7 @@ type Intent struct {
 	// NodeID is Keccak256 ( PublicKey X || Y )
 	NodeID Hash
 	// RoundNumber is the block number proposed.
-	RoundNumber *big.Int
-	// FailedAttempts is the number of times the intent/confirm cycle completed
-	// on the node without a new block being produced. The validity of the
-	// proposer as a leader is depedent on both the RoundNumber and the
-	// FailedAttempts
-	FailedAttempts uint
+	RoundNumber uint64
 	// ParentHash parent block hash
 	ParentHash Hash
 	// TxHash is the hash of the transactions (merkle root for block)

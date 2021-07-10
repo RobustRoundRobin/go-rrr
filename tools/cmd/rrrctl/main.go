@@ -413,7 +413,7 @@ func genextra(ctx *cli.Context) error {
 		return err
 	}
 
-	decodedSignerNodeID, err := cipherCodec.RecoverEnrolerID(extraDecoded.IdentInit[0].Q, extraDecoded.IdentInit[0].U)
+	decodedSignerNodeID, err := cipherCodec.RecoverEnrolerID(extraDecoded.Enrol[0].Q, extraDecoded.Enrol[0].U)
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package rrr
 import (
 	"crypto/ecdsa"
 	"encoding/hex"
+	"fmt"
 	"math/big"
 	"math/rand"
 	"sync"
@@ -20,11 +21,6 @@ type RoundPhase int
 const (
 	// RoundStateInvalid is the invalid and never set state
 	RoundStateInvalid RoundState = iota
-	// RoundStateNeedBlock is entered if the current block doesn't 'make sense'.
-	// We should not ever receive invalid blocks if VerifyHeaders is working,
-	// but this is our backstop. The node will not progress until it sees a new
-	// node from the network.
-	RoundStateNeedBlock
 	// RoundStateInactive is set if the node is not in the active selection for the round.
 	RoundStateInactive // Indicates conditions we expect to be transitor - endorsers not online etc
 
@@ -48,12 +44,29 @@ const (
 	// RoundPhaseConfirm During the confirmation phase leaders are waiting for
 	// all the endorsements to come in so they fairly represent activity.
 	RoundPhaseConfirm
+
+	// RoundPhaseBroadcast during the Broadcast phase all nodes are waiting for
+	// a NewChainHead event for the current round (including the c nsensus
+	// leaders). Any node receiving an otherwise valid HEAD for a different
+	// round must align with the round on the recieved head.
+	RoundPhaseBroadcast
+
+	// Used to absorb and align the start time with the round time. Means we
+	// can deal with most initialisation the same as we do the end of the
+	// Broadcast round *and* we may get a block while we wait.
+	RoundPhaseStartup
 )
 
 type headerByNumberChainReader interface {
 
 	// GetHeaderByNumber retrieves a block header from the database by number.
 	GetHeaderByNumber(number uint64) BlockHeader
+}
+
+type headerByHashChainReader interface {
+
+	// GetHeaderByNumber retrieves a block header from the database by number.
+	GetHeaderByHash([32]byte) BlockHeader
 }
 
 // EndorsmentProtocol implements  5.2 "Endorsement Protocol" and 5.3 "Chain
@@ -67,16 +80,37 @@ type EndorsmentProtocol struct {
 	codec *CipherCodec
 
 	// Node and chain context
-	config     *Config
-	genesisEx  GenesisExtraData
+	config *Config
+	// We use this so often we just pre-compute once, mostly for clarity,
+	// = time.Duration(config.RoundLength) * time.Milliseconds
+	roundLength     time.Duration
+	genesisEx       GenesisExtraData
+	genesisSealTime time.Time
+
+	// gensisRoundStart is The effective start time of the genesis round.
+	// genesisSealTime.Truncate(roundLength)
+	genesisRoundStart time.Time
+
+	// Node identity
 	privateKey *ecdsa.PrivateKey
 	nodeID     Hash // derived from privateKey
+	nodeAddr   Address
 
-	nodeAddr Address
+	vrf ecvrf.VRF
+	T   RoundTime
 
-	vrf  ecvrf.VRF
-	T    *RoundTime
 	Rand *rand.Rand
+	// Updated in the NewChainHead method
+	chainHead            BlockHeader
+	chainHeadExtraHeader *ExtraHeader     // genesis & consensus blocks
+	chainHeadExtra       *SignedExtraData // consensus blocks only
+
+	// For this consensus, round length is multiple seconds. An int64 is more
+	// than big enough.
+	chainHeadRound      uint64
+	chainHeadSealTime   time.Time
+	chainHeadRoundStart time.Time
+	// chainHeadRoundStart  time.Time
 
 	Phase RoundPhase
 
@@ -87,8 +121,17 @@ type EndorsmentProtocol struct {
 	// but it must hold the lock to update it.
 	state RoundState
 
-	Number         *big.Int
-	FailedAttempts uint
+	Number         uint64
+	FailedAttempts uint32
+
+	// Leaders need to automatically re-enrol if they are idle. At the end of
+	// the Confirm phase, if a leader candidate receives no endorsements at
+	// all, it will set this flag. The re-enrol message is then sent from the
+	// end of the broadcast phase. It is sent to all the freshly selected
+	// leaders to give the shortest possible latency on the re-enrolment and to
+	// ensure we send the enrolment to nodes we know to be live. The fallback
+	// is to send to the node that minted the last block.
+	reEnrolSelf bool
 
 	OnlineEndorsers map[Address]Peer
 
@@ -110,7 +153,12 @@ type EndorsmentProtocol struct {
 	pendingEnrolmentsMu sync.RWMutex
 	pendingEnrolments   map[Hash]*EnrolmentBinding
 
-	a *ActiveSelection
+	a ActiveSelection
+
+	// ne worth of indices into the active selection. resampled by
+	// setRoundFromTime. SelectCandidatesAndEndorsers is always passed the
+	// current slice
+	activeSample []int
 }
 
 // NewRoundState creates and initialises a RoundState
@@ -118,7 +166,7 @@ func NewRoundState(
 	codec *CipherCodec, key *ecdsa.PrivateKey, config *Config, logger Logger,
 ) *EndorsmentProtocol {
 
-	s := &EndorsmentProtocol{
+	r := &EndorsmentProtocol{
 		logger:     logger,
 		privateKey: key,
 		codec:      codec,
@@ -127,13 +175,22 @@ func NewRoundState(
 		nodeAddr: PubToAddress(codec.c, &key.PublicKey),
 		config:   config,
 		vrf:      ecvrf.NewSecp256k1Sha256Tai(),
-		T:        NewRoundTime(config.RoundLength, config.ConfirmPhase, logger),
+		T:        NewRoundTime(config),
 
 		pendingEnrolments: make(map[Hash]*EnrolmentBinding),
 
-		Number: new(big.Int),
+		roundLength:  time.Duration(config.RoundLength) * time.Millisecond,
+		activeSample: make([]int, config.Endorsers),
 	}
-	return s
+
+	if logger != nil {
+		logger.Trace(
+			"RRR NewRoundState - timer durations",
+			"round", r.T.Intent+r.T.Confirm+r.T.Broadcast,
+			"i", r.T.Intent, "c", r.T.Confirm, "b", r.T.Broadcast)
+	}
+
+	return r
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
@@ -164,18 +221,41 @@ func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error
 		r.logger.Info("RRR CheckGenesis", "extraData", hex.EncodeToString(extra))
 		err := r.codec.DecodeGenesisExtra(extra, &r.genesisEx)
 		if err != nil {
-			r.logger.Debug("RRR CheckGenesis", "err", err)
+			r.logger.Debug("RRR CheckGenesis - decode extra", "err", err)
 			return err
 		}
+		if err := r.genesisSealTime.UnmarshalBinary(r.genesisEx.ChainInit.SealTime); err != nil {
+			r.logger.Debug("RRR CheckGenesis - unmarshal seal time", "err", err)
+			return err
+		}
+		r.genesisRoundStart = r.genesisSealTime.Truncate(r.roundLength)
 	}
 	r.logger.Trace("RRR CheckGenesis", "chainid", r.genesisEx.ChainID.Hex())
 	if err := r.checkGenesisExtra(&r.genesisEx); err != nil {
 		r.logger.Debug("RRR CheckGenesis", "err", err)
 		return err
 	}
-	r.logger.Debug("RRR CheckGenesis", "genid", r.genesisEx.IdentInit[0].ID.Hex())
+	r.logger.Debug("RRR CheckGenesis", "genid", r.genesisEx.Enrol[0].ID.Hex())
 
 	return nil
+}
+
+func (r *EndorsmentProtocol) StableSeed(chain EngineChainReader, headNumber uint64) (uint64, uint64, error) {
+	if r.config.StablePrefixDepth >= headNumber {
+		seed, err := ConditionSeed(r.genesisEx.Seed)
+		return seed, 0, err
+	}
+	stableHeader := chain.GetHeaderByNumber(headNumber - r.config.StablePrefixDepth)
+	if stableHeader == nil {
+		return 0, 0, fmt.Errorf(
+			"block at stablePrefixDepth not found: %d - %d", headNumber, r.config.StablePrefixDepth)
+	}
+	se, _, _, err := r.codec.DecodeHeaderSeal(stableHeader)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed decoding stable header seal: %v", err)
+	}
+	seed, err := ConditionSeed(se.Seed)
+	return seed, se.Intent.RoundNumber, err
 }
 
 // PrimeActiveSelection should be called for engine Start
@@ -186,45 +266,14 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 	}
 
 	if r.a != nil {
-		r.a.Prime(r.config.Activity, chain.CurrentHeader())
+		r.a.Prime(chain.CurrentHeader())
 		return nil
 	}
 
-	r.a = NewActiveSelection(r.codec, r.nodeID, r.logger)
+	r.a = NewActiveSelection(r.config, r.codec, r.nodeID, r.logger)
 
 	header := chain.CurrentHeader()
-	r.a.Reset(r.config.Activity, header)
-
-	// Implicit dependnecy on ntp for 'block is the clock' model. assume that
-	// the timestamp on the last block was acceptable to the network. The
-	// ethereum yellow paper, for PoW, adjusts difficulty to maintain
-	// homeostasis in the block time interval. This in turn requires that
-	// ethereum nodes have some loosely synchronised view of time. geth uses ntp
-	// to achieve this. etherum SO is full of people not being able to sync
-	// because their node host clocks are out of whack. All of this means 2
-	// things:
-	//   1. Actually, the requirement for loosely synchronised time in rrr
-	//      is no big deal, and we can infact *count* on it in geth.
-	//   2. For the 'block is the clock model' we can safely reduce the
-	//      dependency on ntp in general to just "loosely syncrhonised network" at
-	//      the time of the last block - and our local clock being (currently) good
-	//      relative to the last block time.
-	//
-	// So set the failedCount based in the interval between the last block being
-	// sealed and 'now'
-
-	// Note: we assume quorum/geth for now, and that means this timestamp is nanoseconds
-	blocktime := (time.Duration(header.GetTime()) * time.Nanosecond)
-
-	// RoundLength is in milliseconds. Calculate how many rounds *this* node has
-	// missed since the block was minted. And set FailedAttempts to match. If
-	// only this block has been down or off line, the effects of this will reset
-	// as soon as we see the next block. If the whole network is down - common
-	// for development and some private network scenarios, it will start
-	// everyone off on the same notion of what round it is. This is consistent
-	// with what the paper essentially does for every round. In the paper round
-	// number is always t-now / round time.
-	r.FailedAttempts = uint(blocktime / time.Duration(r.config.RoundLength) * time.Millisecond)
+	r.a.Reset(header)
 
 	return nil
 }
@@ -242,13 +291,13 @@ func (r *EndorsmentProtocol) QueueEnrolment(et *EngEnrolIdentity) error {
 		// Round will be updated when we are ready to submit the enrolment. We
 		// record it here so we can keep track of how long enrolments have been
 		// queued.
-		Round: big.NewInt(0).Set(r.Number),
 		// Block hash filled in when we issue the intent containing this
 		// enrolment.
 
 		// XXX: ReEnrol flag is not necessary for non SGX implementations afaict.
 		ReEnrol: et.ReEnrol,
 	}
+	eb.Round = r.Number
 
 	r.pendingEnrolments[et.NodeID] = eb
 	return nil
@@ -268,50 +317,72 @@ func (r *EndorsmentProtocol) IsEnrolmentPending(nodeID Hash) bool {
 // is sent to the oldest seen. Only the most recent intent from any identity
 // counts.
 func (r *EndorsmentProtocol) NewSignedIntent(et *EngSignedIntent) {
+
 	// endorser <- intent from leader candidate
-	if r.state == RoundStateNeedBlock {
-		r.logger.Trace("RRR engSignedIntent - need block, ignoring", "et.round", et.RoundNumber)
-		return
-	}
-	// See RRR-spec.md for a more thorough explanation, and for why we don't
-	// check the round phase or whether or not we - locally - have selected
-	// ourselves as an endorser. handleIntent.
-	r.logger.Trace("RRR run got engSignedIntent",
-		"round", r.Number, "cand-round", et.RoundNumber, "cand-attempts", et.FailedAttempts,
+
+	r.logger.Trace("RRR NewSignedIntent",
+		"round", r.Number, "cand-round", et.RoundNumber,
 		"candidate", et.NodeID.Hex(), "parent", et.ParentHash.Hex())
 
+	// First check that the local node is an endorser.
+
+	if !r.endorsers[r.nodeAddr] {
+		r.logger.Debug(
+			"RRR handleIntent - not selected as an endorser, ignoring intent",
+			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address().Hex())
+		return
+	}
+
+	// Check that the intent round matches our current round.
+	if r.Number != et.RoundNumber {
+		r.logger.Debug("RRR NewSignedIntent - wrong round",
+			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address().Hex())
+		return
+	}
+
+	// Small differences in timers mean we may see intents for the 'current'
+	// round before we complete the broadcast phase of the previous round. But
+	// we can't do anything about that as we don't know the active selection for
+	// the next round yet. Instead, in PhaseTick, we do our best not to enter
+	// the Intent phase early. This seems to be sufficient. Also, if we are in
+	// the Confirmation phase, we have already sent out our endorsement for the
+	// round as we have already sent out our endorsements for the round.
+
+	var phaseOffset time.Duration
+
+	if r.Phase != RoundPhaseIntent {
+
+		offset := time.Since(r.genesisRoundStart.Add(time.Duration(r.Number) * r.roundLength))
+		switch r.Phase {
+		case RoundPhaseConfirm:
+			phaseOffset = offset - r.T.Intent
+		case RoundPhaseBroadcast:
+			phaseOffset = offset - r.T.Intent - r.T.Confirm
+		}
+
+		r.logger.Debug(
+			"RRR NewSignedIntent - not in intent phase, ignoring",
+			"phase", r.Phase.String(), "phaseOffset", phaseOffset, "r", r.Number,
+			"r", r.Number, "ir", et.RoundNumber, "candidate", et.NodeID.Address().Hex())
+
+		return
+	}
+
+	// Ok, this node is an endorser and in the right phase. Go ahead and
+	// consider the details of the intent.
 	if err := r.handleIntent(et); err != nil {
-		r.logger.Info("RRR run handleIntent", "err", err)
+		r.logger.Info("RRR handleIntent", "err", err)
 	}
 }
 
 // handleIntent accepts the intent and queues it for endorsement if the
-// intendee is a candidate for the current round given the failedAttempts
-// provided on the intent.
+// intendee is a candidate for the current round.
 //  Our critical role here is to always select the *OLDEST* intent we see, and
 // to allow a 'fair' amount of time for intents to arrive before choosing one
-// to endorse. In a healthy network, there will be no failedAttempts, and we
-// could count on being synchronised reasonably with other nodes. In that
-// situation our local 'endorsing' state can be checked. In the unhealthy
-// scenario, or where the current leader candidates are all off line, we can
-// only progress if we re-sample. And in that scenario different nodes could
-// have been un-reachable for arbitrary amounts of time. So their
-// failedAttempts will be arbitrarily different. Further, we can't stop other
-// nodes from lying about their failedAttempts. So even if we were willing to
-// run through randome samples x failedAttempts to check, the result would be
-// meaningless - and would be an obvious way to DOS attack nodes.  Ultimately,
-// it is the job of VerifyHeader, on all honest nodes, to check that the
-// failedAttempts recorded in the block is consistent with the minters identity
-// and the endorsers the minter included.  Now we *could* do special things for
-// the firstAttempt or the first N attempts. But if, in the limit, we have to
-// be robust in the face of some endorsers not checking, I would like to start
-// with them all not checking
+// to endorse.
 func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 
 	var err error
-
-	// Do we agree that the intendee is next in line and that their intent is
-	// appropriate ?
 
 	// Check that the public key recovered from the intent signature matches
 	// the node id declared in the intent
@@ -323,43 +394,33 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	intenderAddr := et.NodeID.Address()
 
 	if recoveredNodeID != et.NodeID {
-		r.logger.Info("RRR handleIntent - sender not signer",
-			"from-addr", intenderAddr.Hex(), "recovered", recoveredNodeID.Hex(),
-			"signed", et.NodeID.Hex())
-		return nil
-	}
-
-	// Check that the intent round matches our current round.
-	if r.Number.Cmp(et.RoundNumber) != 0 {
-		r.logger.Info("RRR handleIntent - wrong round",
-			"r", r.Number, "ir", et.RoundNumber, "from-addr", intenderAddr.Hex())
+		r.logger.Debug("RRR handleIntent - sender not signer",
+			"recovered", recoveredNodeID.Hex(), "signed", et.NodeID.Hex(),
+			"from-addr", intenderAddr.Hex())
 		return nil
 	}
 
 	// Check that the intent comes from a node we have selected locally as a
-	// leader candidate. According to the (matching) roundNumber and their
-	// provided value for FailedAttempts
-	if !r.a.LeaderForRoundAttempt(
-		uint(r.config.Candidates), uint(r.config.Endorsers),
-		intenderAddr, et.Intent.FailedAttempts) {
-		r.logger.Info(
+	// leader candidate. According to the (matching) roundNumber
+	if !r.candidates[intenderAddr] {
+		r.logger.Debug(
 			"RRR handleIntent - intent from non-candidate",
-			"round", r.Number, "cand-f", et.Intent.FailedAttempts, "cand", intenderAddr.Hex())
-		return ErrNotLeaderCandidate
+			"round", r.Number, "cand", intenderAddr.Hex())
+		return nil
 	}
 
 	if r.signedIntent != nil {
 		// It must be in the map if it was active, otherwise we have a
 		// programming error.
-		curAge := r.a.aged[r.signedIntent.NodeID.Address()].Value.(*idActivity).ageBlock
-		newAge := r.a.aged[intenderAddr].Value.(*idActivity).ageBlock
+		curAge, _ := r.a.AgeOf(r.signedIntent.NodeID.Address())
+		newAge, _ := r.a.AgeOf(intenderAddr)
 
 		// Careful here, the 'older' block will have the *lower* number
-		if curAge.Cmp(newAge) < 0 {
+		if curAge < newAge {
 			// current is older
 			r.logger.Trace(
 				"RRR handleIntent - ignoring intent from younger candidate",
-				"cand-addr", intenderAddr.Hex(), "cand-f", et.Intent.FailedAttempts)
+				"cand-addr", intenderAddr.Hex())
 			return nil
 		}
 	}
@@ -383,13 +444,132 @@ func (r *EndorsmentProtocol) broadcastCurrentIntent(b Broadcaster) {
 	}
 
 	msg := r.intent.Msg
-	r.intentMu.Unlock()
 
 	if len(r.OnlineEndorsers) == 0 {
+		r.intentMu.Unlock()
 		return
 	}
 	err := b.Broadcast(r.nodeAddr, r.OnlineEndorsers, msg)
+	r.intentMu.Unlock()
 	if err != nil {
 		r.logger.Info("RRR BroadcastCurrentIntent - Broadcast", "err", err)
 	}
+}
+
+// NewSignedEndorsement keeps track of endorsments received from peers. At the
+// end of the confirmation phase, in PhaseTick, if we are a leader and our
+// *current* intent has sufficient endorsments, we seal the block. This causes
+// geth to broad cast it to the network.
+func (r *EndorsmentProtocol) NewSignedEndorsement(et *EngSignedEndorsement) {
+	// leader <- endorsment from committee
+	if r.state != RoundStateLeaderCandidate {
+		// This is un-expected. Likely late, or possibly from
+		// broken node
+		r.logger.Trace("RRR non-leader ignoring engSignedEndorsement", "round", r.Number)
+		return
+	}
+
+	// Leaders send out their intent at the end of the broadcast phase. Small
+	// differences in timings mean it is common for a leader to still be in the
+	// intent phase when the first endorsments come  back. Its just not worth
+	// trying to compensate for that. If we are in the Broadcast phase it is to
+	// late to do anything with it so we do reject that.
+
+	var phaseOffset time.Duration
+	if r.Phase != RoundPhaseConfirm && r.Phase != RoundPhaseIntent {
+		offset := time.Since(r.genesisRoundStart.Add(time.Duration(r.Number) * r.roundLength))
+		// we are in the Broadcast phase.
+		phaseOffset = offset - r.T.Intent - r.T.Confirm
+
+		r.logger.Trace("RRR engSignedEndorsement - ignoring endorsement received out of phase",
+			"phase", r.Phase.String(), "phaseOffset", phaseOffset, "round", r.Number,
+			"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
+		return
+	}
+
+	r.logger.Trace("RRR engSignedEndorsement",
+		"round", r.Number,
+		"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
+
+	// Provided the endorsment is for our outstanding intent and from an
+	// identity we have selected as an endorser in this round, then its
+	// endorsment will be included in the block - whether we needed it to reach
+	// the endorsment quorum or not.
+	if err := r.handleEndorsement(et); err != nil {
+		r.logger.Info("RRR run handleEndorsement", "err", err)
+	}
+}
+
+// call with intentMu held
+func (r *EndorsmentProtocol) getNumEndorsements() int {
+	if r.intent == nil {
+		// r.logger.Debug("RRR no outstanding intent")
+		return -1
+	}
+	return len(r.intent.Endorsements)
+}
+
+func (r *EndorsmentProtocol) handleEndorsement(et *EngSignedEndorsement) error {
+
+	if et.Endorsement.ChainID != r.genesisEx.ChainID {
+		return fmt.Errorf(
+			"confirmation received for wrong chainid: %s",
+			hex.EncodeToString(et.Endorsement.ChainID[:]))
+	}
+
+	r.intentMu.Lock()
+	defer r.intentMu.Unlock()
+
+	if r.intent == nil {
+		r.logger.Debug(
+			"RRR confirmation stale or un-solicited, no current intent",
+			"endid", et.Endorsement.EndorserID.Hex(), "hintent",
+			et.SignedEndorsement.IntentHash.Hex())
+		return nil
+	}
+
+	pendingIntentHash, err := r.codec.HashIntent(&r.intent.SI.Intent)
+	if err != nil {
+		return err
+	}
+
+	if pendingIntentHash != et.SignedEndorsement.IntentHash {
+		r.logger.Debug("RRR confirmation for stale or unknown intent",
+			"pending", pendingIntentHash.Hex(),
+			"received", et.SignedEndorsement.IntentHash.Hex())
+		return nil
+	}
+
+	// Check the confirmation came from an endorser selected by this node for
+	// the current round
+	endorserAddr := et.SignedEndorsement.EndorserID.Address()
+	if !r.endorsers[endorserAddr] {
+		r.logger.Debug(
+			"RRR confirmation from unexpected endorser", "endorser",
+			et.Endorsement.EndorserID[:])
+		return nil
+	}
+
+	// Check the confirmation is not from an endorser that has endorsed our
+	// intent already this round.
+	if r.intent.Endorsers[endorserAddr] {
+		r.logger.Trace(
+			"RRR redundant confirmation from endorser", "endorser",
+			et.Endorsement.EndorserID[:])
+		return nil
+	}
+
+	// Note: *not* copying, engine run owns everything that is passed to it on
+	// the runningCh
+	r.intent.Endorsements = append(r.intent.Endorsements, &et.SignedEndorsement)
+	r.intent.Endorsers[endorserAddr] = true
+
+	if uint64(len(r.intent.Endorsements)) >= r.config.Quorum {
+		r.logger.Trace("RRR confirmation redundant, have quorum",
+			"endid", et.Endorsement.EndorserID.Hex(),
+			"end#", et.SignedEndorsement.IntentHash.Hex(),
+			"hintent", et.SignedEndorsement.IntentHash.Hex())
+	}
+
+	return nil
 }

@@ -7,6 +7,8 @@ func (p RoundPhase) String() string {
 		return "RoundPhaseIntent"
 	case RoundPhaseConfirm:
 		return "RoundPhaseConfirm"
+	case RoundPhaseBroadcast:
+		return "RoundPhaseBroadcast"
 	default:
 		return "RoundPhaseInvalid"
 	}
@@ -14,8 +16,6 @@ func (p RoundPhase) String() string {
 
 func (s RoundState) String() string {
 	switch s {
-	case RoundStateNeedBlock:
-		return "RoundStateNeedBlock"
 	case RoundStateInvalid:
 		return "RoundStateInvalid"
 	case RoundStateInactive:

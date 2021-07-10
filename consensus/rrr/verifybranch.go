@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"golang.org/x/crypto/sha3"
 )
@@ -26,6 +27,8 @@ type VerifyBranchChainReader interface {
 
 	// GetHeaderByNumber retrieves a block header from the database by number.
 	GetHeaderByNumber(number uint64) BlockHeader
+	// GetHeaderByNumber retrieves a block header from the database by number.
+	GetHeaderByHash(hash [32]byte) BlockHeader
 }
 
 func (r *EndorsmentProtocol) checkGenesisExtra(gex *GenesisExtraData) error {
@@ -33,18 +36,19 @@ func (r *EndorsmentProtocol) checkGenesisExtra(gex *GenesisExtraData) error {
 	// All of the enrolments in the genesis block are signed by the long term
 	// identity key (node key) of the genesis node.
 	ok, genPubBytes, err := r.codec.VerifyRecoverNodeSig(
-		gex.IdentInit[0].ID, gex.IdentInit[0].U[:], gex.IdentInit[0].Q[:])
+		gex.Enrol[0].ID, gex.Enrol[0].U[:], gex.Enrol[0].Q[:])
 	if err != nil || !ok {
 		r.logger.Trace(
 			"id0",
-			"id", gex.IdentInit[0].ID.Hex(), "u", gex.IdentInit[0].U.Hex(),
-			"q", hex.EncodeToString(gex.IdentInit[0].Q[:]))
+			"id", gex.Enrol[0].ID.Hex(), "u", gex.Enrol[0].U.Hex(),
+			"q", hex.EncodeToString(gex.Enrol[0].Q[:]),
+			"ok", ok, "err", err)
 		return fmt.Errorf("genesis identity invalid signature: %w", errGensisIdentitiesInvalid)
 	}
 
 	// Check the genesis seed and the signatures of all the contributions to the genesis seed alpha.
 	hasher := sha3.NewLegacyKeccak256()
-	for i, ident := range gex.IdentInit {
+	for i, ident := range gex.Enrol {
 		a := gex.Alpha[i]
 
 		if !r.codec.VerifyNodeSig(ident.ID, a.Contribution[:], a.Sig[:]) {
@@ -106,7 +110,7 @@ func (r *EndorsmentProtocol) VerifyBranchHeaders(
 		}
 		r.logger.Debug(
 			"RRR VerifyBranchHeaders - genesis extra",
-			"genid", genesisEx.IdentInit[0].ID.Hex(),
+			"genid", genesisEx.Enrol[0].ID.Hex(),
 			"chainid", genesisEx.ChainID.Hex())
 
 		return nil
@@ -130,7 +134,7 @@ func (r *EndorsmentProtocol) VerifyBranchHeaders(
 	return nil
 }
 
-func (r *EndorsmentProtocol) VerifyHeader(chain headerByNumberChainReader, header BlockHeader) (*SignedExtraData, error) {
+func (r *EndorsmentProtocol) VerifyHeader(chain headerByHashChainReader, header BlockHeader) (*SignedExtraData, error) {
 
 	bigBlockNumber := header.GetNumber()
 	if bigBlockNumber.Cmp(big0) == 0 {
@@ -155,12 +159,17 @@ func (r *EndorsmentProtocol) VerifyHeader(chain headerByNumberChainReader, heade
 			se.Intent.ChainID.Hex(), r.genesisEx.ChainID.Hex())
 	}
 
-	// Check that the round in the intent matches the block number
-	if se.Intent.RoundNumber.Cmp(bigBlockNumber) != 0 {
-		return se, fmt.Errorf(
-			"rrr sealed intent invalid intent round number: %s != block number: %s",
-			se.Intent.RoundNumber, bigBlockNumber)
+	// This is just telemetry for interest, its not part of validation.
+	// Endorsers are responsible for rejecting intents for invalid rounds.
+	intentTime := r.genesisRoundStart.Add(
+		r.roundLength * time.Duration(se.Intent.RoundNumber))
+
+	sealTime := time.Time{}
+	if err = sealTime.UnmarshalBinary(se.SealTime); err == nil {
+		r.logger.Debug("RRR VerifyHeader - intent round start vs seal time", "d", sealTime.Sub(intentTime))
+		return se, err
 	}
+	// End telemetry
 
 	// Ensure that the coinbase is valid
 	if header.GetNonce() != emptyNonce {
@@ -195,15 +204,14 @@ func (r *EndorsmentProtocol) VerifyHeader(chain headerByNumberChainReader, heade
 	// Verify the seed VRF result.
 	blockNumber := bigBlockNumber.Uint64()
 
-	// The input (or alpha) is from the block at the head of the stable prefix
-	// (or the genesis)
+	// The input (or alpha) is from the parent block
 	alpha := r.genesisEx.ChainInit.Seed
-	if r.config.StablePrefixDepth < blockNumber {
-		stableHeader := chain.GetHeaderByNumber(blockNumber - r.config.StablePrefixDepth)
-		if stableHeader == nil {
-			return nil, fmt.Errorf("block at stablePrefixDepth not found: %d - %d", blockNumber, r.config.StablePrefixDepth)
+	if blockNumber > 1 {
+		parent := chain.GetHeaderByHash(header.GetParentHash())
+		if parent == nil {
+			return nil, fmt.Errorf("parent block not found for block %d", blockNumber)
 		}
-		se, _, _, err := r.codec.DecodeHeaderSeal(stableHeader)
+		se, _, _, err := r.codec.DecodeHeaderSeal(parent)
 		if err != nil {
 			return nil, fmt.Errorf("failed decoding stable header seal: %v", err)
 		}

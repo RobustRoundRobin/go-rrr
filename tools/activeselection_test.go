@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/RobustRoundRobin/go-rrr/consensus/rrr"
 	"github.com/RobustRoundRobin/go-rrr/secp256k1suite"
@@ -29,6 +30,22 @@ var (
 	dummyProof = []byte{0, 1, 2, 3, 4, 5, 6, 7}
 	bigOne     = new(big.Int).SetInt64(1)
 )
+
+func makeTimeStamp(t *testing.T, sec int64, nsec int64) []byte {
+	ts := time.Unix(sec, nsec)
+	b, err := ts.MarshalBinary()
+	require.Nil(t, err)
+	return b
+}
+
+func defaultConfig() *rrr.Config {
+	return &rrr.Config{
+		Activity:   10,
+		Candidates: 2,
+		Endorsers:  8,
+		Quorum:     5,
+	}
+}
 
 func TestDecodeGenesisActivity(t *testing.T) {
 
@@ -68,13 +85,14 @@ func TestDecodeActivity(t *testing.T) {
 	require.NoError(err)
 	genesis := makeBlockHeader(withExtra(data))
 
-	intent := fillIntent(nil, ge.ChainID, keys[0], genesis, big.NewInt(1), 0)
+	intent := fillIntent(nil, ge.ChainID, keys[0], genesis, big.NewInt(1))
 
 	se1 := requireMakeSignedEndorsement(t, ge.ChainID, keys[1], intent)
 	se2 := requireMakeSignedEndorsement(t, ge.ChainID, keys[2], intent)
 
 	_, data = requireMakeSignedExtraData(t,
-		keys[0], 0, intent, []*rrr.SignedEndorsement{se1, se2}, []byte{8, 9, 10, 11, 12, 13, 14, 15})
+		keys[0], makeTimeStamp(t, 0, 0),
+		intent, []*rrr.SignedEndorsement{se1, se2}, []byte{8, 9, 10, 11, 12, 13, 14, 15})
 
 	block1 := makeBlockHeader(withNumber(1), withSeal(data))
 	a := &rrr.BlockActivity{}
@@ -92,8 +110,8 @@ func NewLogger(l log.Logger) *Logger {
 	return &Logger{L: l}
 }
 
-func NewActiveSelection(codec *rrr.CipherCodec, logger rrr.Logger) *rrr.ActiveSelection {
-	a := rrr.NewActiveSelection(codec, rrr.Hash{1, 2, 3}, logger)
+func NewActiveSelection(config *rrr.Config, codec *rrr.CipherCodec, logger rrr.Logger) rrr.ActiveSelection {
+	a := rrr.NewActiveSelection(config, codec, rrr.Hash{1, 2, 3}, logger)
 	return a
 }
 
@@ -105,21 +123,19 @@ func TestAccumulateGenesisActivity(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	tActive := uint64(10)
 	numIdents := 12
 
 	net := newNetwork(t, numIdents)
 	ch := newChain(net.genesis)
 
-	a := NewActiveSelection(NewCodec(), NewLogger(nil))
+	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
 
-	a.Reset(tActive, net.genesis)
+	a.Reset(net.genesis)
 
-	err := a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+	err := a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
 
 	require.NoError(err)
-	assert.Equal(a.Len(), numIdents, "missing active from selection")
+	assert.Equal(a.NumActive(), numIdents, "missing active from selection")
 
 	// For the genesis block, the age ordering should exactly match the
 	// enrolment order. And the identity that signed the genesis block should be
@@ -140,21 +156,18 @@ func TestFirstAccumulate(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	tActive := uint64(10)
 	net := newNetwork(t, 3)
 	ch := newChain(net.genesis)
 	ch.Extend(net, 0, 1, 2)
 
-	a := NewActiveSelection(NewCodec(), NewLogger(nil))
-	a.Reset(tActive, net.genesis)
+	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
+	a.Reset(net.genesis)
 
 	err := a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+		net.ge.ChainID, ch, ch.CurrentHeader())
 
 	require.NoError(err)
-	assert.Equal(a.LenAged(), 3, "missing active from aged")
-	assert.Equal(a.Len(), 3, "missing active from selection")
-	assert.Equal(a.LenIdle(), 0, "idle identities found")
+	assert.Equal(a.NumActive(), 3, "missing active from selection")
 
 	// the youngest identity should be at the front and should be the id=0
 	id, ok := net.nodeID2id[a.YoungestNodeID()]
@@ -170,18 +183,17 @@ func TestFirstAccumulate(t *testing.T) {
 func TestAccumulateTwice(t *testing.T) {
 	require := require.New(t)
 
-	tActive := uint64(10)
 	numIdents := 12
 
 	net := newNetwork(t, numIdents)
 	ch := newChain(net.genesis)
 
-	a := NewActiveSelection(NewCodec(), NewLogger(nil))
-	a.Reset(tActive, net.genesis)
+	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
+	a.Reset(net.genesis)
 
 	// Establish the intial ordering from the genesis block.
 	err := a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+		net.ge.ChainID, ch, ch.CurrentHeader())
 	require.NoError(err)
 
 	net.requireOrder(t, a, []int{11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0})
@@ -197,7 +209,7 @@ func TestAccumulateTwice(t *testing.T) {
 	ch.Extend(net, 1, 2, 3, 4)
 
 	err = a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+		net.ge.ChainID, ch, ch.CurrentHeader())
 	require.NoError(err)
 
 	// Note: only the sealer id's should move
@@ -212,14 +224,13 @@ func TestBranchDetection(t *testing.T) {
 	logger := log.New()
 	logger.SetHandler(log.StreamHandler(os.Stdout, log.TerminalFormat(false)))
 
-	tActive := uint64(10)
 	numIdents := 12
 
 	net := newNetwork(t, numIdents)
 	ch := newChain(net.genesis)
 
-	a := NewActiveSelection(NewCodec(), NewLogger(nil))
-	a.Reset(tActive, net.genesis)
+	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
+	a.Reset(net.genesis)
 
 	// build a 4 block chain
 	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
@@ -227,20 +238,18 @@ func TestBranchDetection(t *testing.T) {
 	ch.Extend(net, 3, 4, 5, 6)
 	ch.Extend(net, 4, 5, 6, 7)
 
-	err := a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+	err := a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
 	require.NoError(err)
 
 	// Make a fork from block 2
-	intent := net.newIntent(5, ch.blocks[2], 0)
+	intent := net.newIntent(5, ch.blocks[2])
 	confirm := net.endorseIntent(intent, 6, 7, 8)
 	forkFirst := net.sealBlock(5, intent, confirm, dummySeed)
 	ch.Add(forkFirst)
 	// Now CurrentBlock will return the forked block so we can use extend
 	ch.Extend(net, 6, 7, 8, 9)
 
-	err = a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+	err = a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
 	require.True(errors.Is(err, rrr.ErrBranchDetected))
 }
 
@@ -257,24 +266,24 @@ func TestShortActityHorizon(t *testing.T) {
 
 	logger := NewLogger(nil)
 
-	tActive := uint64(5)
 	numIdents := 12
 
 	net := newNetwork(t, numIdents)
 	ch := newChain(net.genesis)
 
 	codec := NewCodec()
-	a := NewActiveSelection(codec, logger)
+	config := defaultConfig()
+	config.Activity = 5
+	a := NewActiveSelection(config, codec, logger)
 
-	a.Reset(tActive, net.genesis)
+	a.Reset(net.genesis)
 
 	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
 	ch.Extend(net, 2, 3, 4, 5)
 	ch.Extend(net, 3, 4, 5, 6)
 	ch.Extend(net, 4, 5, 6, 7)
 
-	err := a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+	err := a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
 	require.NoError(err)
 
 	// We have exactly 5 blocks including the genesis. The genesis has activity
@@ -293,8 +302,7 @@ func TestShortActityHorizon(t *testing.T) {
 	ch.Extend(net, 11, 0, 1, 2)
 	ch.Extend(net, 0, 1, 2, 3)
 
-	err = a.AccumulateActive(
-		net.ge.ChainID, tActive, ch, ch.CurrentHeader())
+	err = a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
 	require.NoError(err)
 
 	// Now we expect the sealers of the most recent 5 to move, and everything
@@ -302,11 +310,11 @@ func TestShortActityHorizon(t *testing.T) {
 	// are beyond the tActive horizon. When idles are fully implemented,
 	// skipping will involve moving to the idle pool.
 
-	order = []int{0, 11, 10, 9, 8, 4, 3, 2, 1, 7, 6, 5}
+	order = []int{0, 11, 10, 9, 8, 4, 3, 2, 1} /* culled , 7, 6, 5 */
 	net.requireOrder(t, a, order)
 }
 
-func (net *network) requireOrder(t *testing.T, a *rrr.ActiveSelection, order []int) {
+func (net *network) requireOrder(t *testing.T, a rrr.ActiveSelection, order []int) {
 
 	nok := 0
 
@@ -370,7 +378,7 @@ func (ch *chain) GetHeaderByHash(hash [32]byte) rrr.BlockHeader {
 func (ch *chain) Extend(net *network, idSeal int, idConfirm ...int) rrr.BlockHeader {
 	parent := ch.CurrentHeader()
 
-	intent := net.newIntent(idSeal, parent, 0)
+	intent := net.newIntent(idSeal, parent)
 	confirm := net.endorseIntent(intent, idConfirm...)
 	header := net.sealBlock(idSeal, intent, confirm, dummySeed)
 	ch.Add(header)
@@ -417,14 +425,14 @@ func newNetwork(t *testing.T, numIdents int) *network {
 }
 
 func (net *network) newIntent(
-	idFrom int, parent rrr.BlockHeader, failedAttempts uint) *rrr.Intent {
+	idFrom int, parent rrr.BlockHeader) *rrr.Intent {
 	key := net.id2key[idFrom]
 	require.NotZero(net.t, key)
 
 	roundNumber := big.NewInt(0)
 	roundNumber.Add(parent.GetNumber(), bigOne)
 	return fillIntent(
-		nil, net.ge.ChainID, key, parent, roundNumber, failedAttempts)
+		nil, net.ge.ChainID, key, parent, roundNumber)
 }
 
 func (net *network) endorseIntent(
@@ -446,10 +454,11 @@ func (net *network) sealBlock(
 	key := net.id2key[idSealer]
 	require.NotZero(net.t, key)
 
-	_, data := requireMakeSignedExtraData(net.t, key, 0, intent, confirm, dummySeed)
+	_, data := requireMakeSignedExtraData(
+		net.t, key, makeTimeStamp(net.t, 0, 0), intent, confirm, dummySeed)
 
 	return makeBlockHeader(
-		withNumber(intent.RoundNumber.Int64()),
+		withNumber(int64(intent.RoundNumber)),
 		withParent(common.Hash(intent.ParentHash)),
 		withSeal(data))
 }
@@ -457,18 +466,20 @@ func (net *network) sealBlock(
 func requireMakeSignedExtraData(
 	t *testing.T,
 	sealer *ecdsa.PrivateKey,
-	sealTime uint64, intent *rrr.Intent, confirm []*rrr.SignedEndorsement,
+	sealTime []byte, intent *rrr.Intent, confirm []*rrr.SignedEndorsement,
 	seed []byte,
 ) (*rrr.SignedExtraData, []byte) {
 
 	data := &rrr.SignedExtraData{
 		ExtraData: rrr.ExtraData{
-			SealTime: sealTime,
-			Intent:   *intent,
-			Confirm:  make([]rrr.Endorsement, len(confirm)),
+			ExtraHeader: rrr.ExtraHeader{
+				SealTime: sealTime,
+			},
+			Intent:  *intent,
+			Confirm: make([]rrr.Endorsement, len(confirm)),
 		},
 	}
-	data.Intent.RoundNumber = big.NewInt(0).Set(intent.RoundNumber)
+	data.Intent.RoundNumber = intent.RoundNumber
 	if seed != nil {
 		copy(data.Seed, seed)
 	}
@@ -505,7 +516,7 @@ func requireMakeSignedEndorsement(
 func fillIntent(
 	i *rrr.Intent,
 	chainID rrr.Hash, proposer *ecdsa.PrivateKey,
-	parent rrr.BlockHeader, roundNumber *big.Int, failedAttempts uint) *rrr.Intent {
+	parent rrr.BlockHeader, roundNumber *big.Int) *rrr.Intent {
 
 	c := secp256k1suite.NewCipherSuite()
 
@@ -515,8 +526,7 @@ func fillIntent(
 
 	i.ChainID = chainID
 	i.NodeID = rrr.NodeIDFromPub(c, &proposer.PublicKey)
-	i.RoundNumber = big.NewInt(0).Set(roundNumber)
-	i.FailedAttempts = failedAttempts
+	i.RoundNumber = roundNumber.Uint64()
 	i.ParentHash = rrr.Hash(parent.Hash())
 	i.TxHash = rrr.Hash(parent.GetTxHash())
 	return i

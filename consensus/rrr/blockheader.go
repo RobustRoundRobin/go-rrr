@@ -2,6 +2,9 @@ package rrr
 
 import "math/big"
 
+type SignedExtraDecoder interface {
+	DecodeSignedExtraData(se *SignedExtraData, b []byte) ([]byte, error)
+}
 type BlockHeader interface {
 	Hash() [32]byte        // includes rrr seal
 	HashForSeal() [32]byte // excludes rrr seal
@@ -11,6 +14,7 @@ type BlockHeader interface {
 	GetNumber() *big.Int
 	GetTime() uint64
 	GetSeal() []byte
+	GetRound(SignedExtraDecoder) (uint64, error)
 	GetNonce() [8]byte
 	GetExtra() []byte
 }
