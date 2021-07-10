@@ -20,14 +20,14 @@ experimentation and testing.
 ## Remaining items from the paper, required for production readines:
 
 * [x] VRF's and proofs for seeding the random selection of endorsers
-* [ ] VRF seed initialisation
+* [x] VRF seed initialisation
 * [x] Allow the chain to progress if all Nc candidates in a round fail to
       seal a block. Currently one of the Nc candidates must seal a block in
       order for the chain to progress - as we have for convenience made round ==
       block. A round is triggered by a new chain head. And the Nc identities
       are only updated at the start of a round.
-* [ ] Exclude unresponsive nodes from selection - make idle
-* [ ] Re-enrolment of idle identities
+* [x] Exclude unresponsive nodes from selection - make idle
+* [x] Re-enrolment of idle identities
 * [x] Enrolement post genesis
 * [ ] Respect --permissioned and --permissioned-nodes (this offers a form of identity removal)
 * [ ] Wait Te rounds before considering a freshly enrolled identity 'active'.
@@ -37,19 +37,10 @@ experimentation and testing.
 
 ## Divergences from the paper
 
-* [ ] The paper allows identities to be both candidates and endorsers in the
-      same round. This is troublesome for small networks. In this
-      implementation, an active identity is either a leader candidate or an
-      endorser - never both.
 * [ ] The paper specifies that active identites are sorted by public key before
       being randomly sampled to select endorsers. In this implementation the
       identities are conveniently available 'pre' sorted by age. So we do not
       sort by public key.
-* [ ] The paper specifies that leader candidates only consider endorsements
-      during the confirmation phase. In this implementation, the leader
-      candidate will accept an endorsement at any point in the round *after* it
-      has broadcast the intent. The endorsement must meet all the other
-      validation criteria.
 
 ## Items from the paper we have left out but would like to do:
 

@@ -5,7 +5,6 @@ package rrr
 // the block.
 
 import (
-	"encoding/hex"
 	"fmt"
 	"time"
 )
@@ -165,115 +164,8 @@ func (r *EndorsmentProtocol) newPendingIntent(
 	return pe, nil
 }
 
-// NewSignedEndorsement keeps track of endorsments received from peers. At the
-// end of the confirmation phase, in PhaseTick, if we are a leader and our
-// *current* intent has sufficient endorsments, we seal the block. This causes
-// geth to broad cast it to the network.
-func (r *EndorsmentProtocol) NewSignedEndorsement(et *EngSignedEndorsement) {
-	// leader <- endorsment from committee
-	if r.state != RoundStateLeaderCandidate {
-		// This is un-expected. Likely late, or possibly from
-		// broken node
-		r.logger.Trace("RRR non-leader ignoring engSignedEndorsement", "round", r.Number)
-		return
-	}
-
-	if r.Phase != RoundPhaseConfirm {
-		r.logger.Trace("RRR engSignedEndorsement - ignoring endorsement received out of phase",
-			"round", r.Number,
-			"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
-		return
-	}
-
-	r.logger.Trace("RRR engSignedEndorsement",
-		"round", r.Number,
-		"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
-
-	// Provided the endorsment is for our outstanding intent and from an
-	// identity we have selected as an endorser in this round, then its
-	// endorsment will be included in the block - whether we needed it to reach
-	// the endorsment quorum or not.
-	if err := r.handleEndorsement(et); err != nil {
-		r.logger.Info("RRR run handleEndorsement", "err", err)
-	}
-}
-
-func (r *EndorsmentProtocol) handleEndorsement(et *EngSignedEndorsement) error {
-
-	if et.Endorsement.ChainID != r.genesisEx.ChainID {
-		return fmt.Errorf(
-			"confirmation received for wrong chainid: %s",
-			hex.EncodeToString(et.Endorsement.ChainID[:]))
-	}
-
-	r.intentMu.Lock()
-	defer r.intentMu.Unlock()
-
-	if r.intent == nil {
-		r.logger.Debug(
-			"RRR confirmation stale or un-solicited, no current intent",
-			"endid", et.Endorsement.EndorserID.Hex(), "hintent",
-			et.SignedEndorsement.IntentHash.Hex())
-		return nil
-	}
-
-	pendingIntentHash, err := r.codec.HashIntent(&r.intent.SI.Intent)
-	if err != nil {
-		return err
-	}
-
-	if pendingIntentHash != et.SignedEndorsement.IntentHash {
-		r.logger.Debug("RRR confirmation for stale or unknown intent",
-			"pending", pendingIntentHash.Hex(),
-			"received", et.SignedEndorsement.IntentHash.Hex())
-		return nil
-	}
-
-	// Check the confirmation came from an endorser selected by this node for
-	// the current round
-	endorserAddr := et.SignedEndorsement.EndorserID.Address()
-	if !r.endorsers[endorserAddr] {
-		r.logger.Debug(
-			"RRR confirmation from unexpected endorser", "endorser",
-			et.Endorsement.EndorserID[:])
-		return nil
-	}
-
-	// Check the confirmation is not from an endorser that has endorsed our
-	// intent already this round.
-	if r.intent.Endorsers[endorserAddr] {
-		r.logger.Trace(
-			"RRR redundant confirmation from endorser", "endorser",
-			et.Endorsement.EndorserID[:])
-		return nil
-	}
-
-	// Note: *not* copying, engine run owns everything that is passed to it on
-	// the runningCh
-	r.intent.Endorsements = append(r.intent.Endorsements, &et.SignedEndorsement)
-	r.intent.Endorsers[endorserAddr] = true
-
-	if uint64(len(r.intent.Endorsements)) >= r.config.Quorum {
-		r.logger.Trace("RRR confirmation redundant, have quorum",
-			"endid", et.Endorsement.EndorserID.Hex(),
-			"end#", et.SignedEndorsement.IntentHash.Hex(),
-			"hintent", et.SignedEndorsement.IntentHash.Hex())
-	}
-
-	return nil
-}
-
 type sealChainReader interface {
 	GetHeaderByNumber(number uint64) BlockHeader
-}
-
-// call with intentMu held
-func (r *EndorsmentProtocol) getNumEndorsements() int {
-	if r.intent == nil {
-		// r.logger.Debug("RRR no outstanding intent")
-		return -1
-	}
-	return len(r.intent.Endorsements)
 }
 
 // verifyEndorsements verifies the endorsements for the current intent.
@@ -358,6 +250,17 @@ func (r *EndorsmentProtocol) sealCurrentBlock(beta, pi []byte, chain sealChainRe
 
 	i := int(0)
 	for _, eb := range r.pendingEnrolments {
+
+		// Because the idling of leaders is pretty strict, we make nodes enrol
+		// automaticaly on startup. We don't want the noise of redundant
+		// enrolments in the block headers so we just filter them out.
+
+		if r.a.IsActive(eb.NodeID.Address()) {
+			r.logger.Info(
+				"RRR sealCurrentBlock - ignoring redundant enrolment",
+				"node", eb.NodeID.Hex(), "addr", eb.NodeID.Address().Hex())
+			continue
+		}
 
 		// The round and block hash are not known when the enrolment is queued.
 		eb.Round = r.Number

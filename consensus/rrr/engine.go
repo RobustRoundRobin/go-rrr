@@ -11,14 +11,7 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 )
 
-const (
-	RoundAgreementDefault    = ""
-	RoundAgreementBlockClock = "blockclock"
-	RoundAgreementNTP        = "ntp"
-)
-
 var (
-	ErrRoundAgreementInvalid        = errors.New("'blockclock' or 'ntp' are the only supported methods")
 	ErrIntentAndConfirmPhaseToLarge = errors.New("intent + confirm phase can not be longer than the round")
 	ErrIncompatibleChainReader      = errors.New("chainreader missing required interfaces for RRR")
 	ErrNoGenesisHeader              = errors.New("failed to get genesis header")
@@ -165,21 +158,6 @@ func NewEngine(
 			"i=%v, c=%v, round=%v: %w",
 			config.IntentPhase, config.ConfirmPhase, config.RoundLength, ErrIntentAndConfirmPhaseToLarge)
 	}
-
-	switch config.RoundAgreement {
-	case RoundAgreementDefault:
-		logger.Debug("defaulting to time based round agreement")
-		fallthrough
-	case RoundAgreementNTP:
-		config.RoundAgreement = RoundAgreementNTP
-	case RoundAgreementBlockClock:
-		fallthrough
-	default:
-		return nil, fmt.Errorf(
-			"roundagrement '%s' unknown or not supported: %w",
-			config.RoundAgreement, ErrRoundAgreementInvalid)
-	}
-	logger.Info("round agreement", "method", config.RoundAgreement)
 
 	// Only get err from NewRC if zize requested is <=0
 	peerMessages, err := lru.NewARC(lruPeers)

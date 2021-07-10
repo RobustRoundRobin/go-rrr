@@ -21,11 +21,6 @@ type RoundPhase int
 const (
 	// RoundStateInvalid is the invalid and never set state
 	RoundStateInvalid RoundState = iota
-	// RoundStateNeedBlock is entered if the current block doesn't 'make sense'.
-	// We should not ever receive invalid blocks if VerifyHeaders is working,
-	// but this is our backstop. The node will not progress until it sees a new
-	// node from the network.
-	RoundStateNeedBlock
 	// RoundStateInactive is set if the node is not in the active selection for the round.
 	RoundStateInactive // Indicates conditions we expect to be transitor - endorsers not online etc
 
@@ -322,18 +317,61 @@ func (r *EndorsmentProtocol) IsEnrolmentPending(nodeID Hash) bool {
 // is sent to the oldest seen. Only the most recent intent from any identity
 // counts.
 func (r *EndorsmentProtocol) NewSignedIntent(et *EngSignedIntent) {
-	// endorser <- intent from leader candidate
-	if r.state == RoundStateNeedBlock {
-		r.logger.Trace("RRR engSignedIntent - need block, ignoring", "et.round", et.RoundNumber)
-		return
-	}
 
-	r.logger.Trace("RRR run got engSignedIntent",
+	// endorser <- intent from leader candidate
+
+	r.logger.Trace("RRR NewSignedIntent",
 		"round", r.Number, "cand-round", et.RoundNumber,
 		"candidate", et.NodeID.Hex(), "parent", et.ParentHash.Hex())
 
+	// First check that the local node is an endorser.
+
+	if !r.endorsers[r.nodeAddr] {
+		r.logger.Debug(
+			"RRR handleIntent - not selected as an endorser, ignoring intent",
+			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address().Hex())
+		return
+	}
+
+	// Check that the intent round matches our current round.
+	if r.Number != et.RoundNumber {
+		r.logger.Debug("RRR NewSignedIntent - wrong round",
+			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address().Hex())
+		return
+	}
+
+	// Small differences in timers mean we may see intents for the 'current'
+	// round before we complete the broadcast phase of the previous round. But
+	// we can't do anything about that as we don't know the active selection for
+	// the next round yet. Instead, in PhaseTick, we do our best not to enter
+	// the Intent phase early. This seems to be sufficient. Also, if we are in
+	// the Confirmation phase, we have already sent out our endorsement for the
+	// round as we have already sent out our endorsements for the round.
+
+	var phaseOffset time.Duration
+
+	if r.Phase != RoundPhaseIntent {
+
+		offset := time.Since(r.genesisRoundStart.Add(time.Duration(r.Number) * r.roundLength))
+		switch r.Phase {
+		case RoundPhaseConfirm:
+			phaseOffset = offset - r.T.Intent
+		case RoundPhaseBroadcast:
+			phaseOffset = offset - r.T.Intent - r.T.Confirm
+		}
+
+		r.logger.Debug(
+			"RRR NewSignedIntent - not in intent phase, ignoring",
+			"phase", r.Phase.String(), "phaseOffset", phaseOffset, "r", r.Number,
+			"r", r.Number, "ir", et.RoundNumber, "candidate", et.NodeID.Address().Hex())
+
+		return
+	}
+
+	// Ok, this node is an endorser and in the right phase. Go ahead and
+	// consider the details of the intent.
 	if err := r.handleIntent(et); err != nil {
-		r.logger.Info("RRR run handleIntent", "err", err)
+		r.logger.Info("RRR handleIntent", "err", err)
 	}
 }
 
@@ -345,30 +383,6 @@ func (r *EndorsmentProtocol) NewSignedIntent(et *EngSignedIntent) {
 func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 
 	var err error
-
-	// Do we agree that the intendee is next in line and that their intent is
-	// appropriate ?
-
-	if !r.endorsers[r.nodeAddr] {
-		r.logger.Debug(
-			"RRR handleIntent - not selected as an endorser, ignoring intent",
-			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address())
-		return nil
-	}
-
-	if r.Phase != RoundPhaseIntent {
-		r.logger.Debug(
-			"RRR handleIntent - not in intent phase, ignoring intent",
-			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address())
-		return nil
-	}
-
-	// Check that the intent round matches our current round.
-	if r.Number != et.RoundNumber {
-		r.logger.Debug("RRR handleIntent - wrong round",
-			"r", r.Number, "ir", et.RoundNumber, "from-addr", et.NodeID.Address().Hex())
-		return nil
-	}
 
 	// Check that the public key recovered from the intent signature matches
 	// the node id declared in the intent
@@ -398,11 +412,11 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	if r.signedIntent != nil {
 		// It must be in the map if it was active, otherwise we have a
 		// programming error.
-		curAge := r.a.AgeOf(r.signedIntent.NodeID.Address())
-		newAge := r.a.AgeOf(intenderAddr)
+		curAge, _ := r.a.AgeOf(r.signedIntent.NodeID.Address())
+		newAge, _ := r.a.AgeOf(intenderAddr)
 
 		// Careful here, the 'older' block will have the *lower* number
-		if curAge.Cmp(newAge) < 0 {
+		if curAge < newAge {
 			// current is older
 			r.logger.Trace(
 				"RRR handleIntent - ignoring intent from younger candidate",
@@ -440,4 +454,122 @@ func (r *EndorsmentProtocol) broadcastCurrentIntent(b Broadcaster) {
 	if err != nil {
 		r.logger.Info("RRR BroadcastCurrentIntent - Broadcast", "err", err)
 	}
+}
+
+// NewSignedEndorsement keeps track of endorsments received from peers. At the
+// end of the confirmation phase, in PhaseTick, if we are a leader and our
+// *current* intent has sufficient endorsments, we seal the block. This causes
+// geth to broad cast it to the network.
+func (r *EndorsmentProtocol) NewSignedEndorsement(et *EngSignedEndorsement) {
+	// leader <- endorsment from committee
+	if r.state != RoundStateLeaderCandidate {
+		// This is un-expected. Likely late, or possibly from
+		// broken node
+		r.logger.Trace("RRR non-leader ignoring engSignedEndorsement", "round", r.Number)
+		return
+	}
+
+	// Leaders send out their intent at the end of the broadcast phase. Small
+	// differences in timings mean it is common for a leader to still be in the
+	// intent phase when the first endorsments come  back. Its just not worth
+	// trying to compensate for that. If we are in the Broadcast phase it is to
+	// late to do anything with it so we do reject that.
+
+	var phaseOffset time.Duration
+	if r.Phase != RoundPhaseConfirm && r.Phase != RoundPhaseIntent {
+		offset := time.Since(r.genesisRoundStart.Add(time.Duration(r.Number) * r.roundLength))
+		// we are in the Broadcast phase.
+		phaseOffset = offset - r.T.Intent - r.T.Confirm
+
+		r.logger.Trace("RRR engSignedEndorsement - ignoring endorsement received out of phase",
+			"phase", r.Phase.String(), "phaseOffset", phaseOffset, "round", r.Number,
+			"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
+		return
+	}
+
+	r.logger.Trace("RRR engSignedEndorsement",
+		"round", r.Number,
+		"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
+
+	// Provided the endorsment is for our outstanding intent and from an
+	// identity we have selected as an endorser in this round, then its
+	// endorsment will be included in the block - whether we needed it to reach
+	// the endorsment quorum or not.
+	if err := r.handleEndorsement(et); err != nil {
+		r.logger.Info("RRR run handleEndorsement", "err", err)
+	}
+}
+
+// call with intentMu held
+func (r *EndorsmentProtocol) getNumEndorsements() int {
+	if r.intent == nil {
+		// r.logger.Debug("RRR no outstanding intent")
+		return -1
+	}
+	return len(r.intent.Endorsements)
+}
+
+func (r *EndorsmentProtocol) handleEndorsement(et *EngSignedEndorsement) error {
+
+	if et.Endorsement.ChainID != r.genesisEx.ChainID {
+		return fmt.Errorf(
+			"confirmation received for wrong chainid: %s",
+			hex.EncodeToString(et.Endorsement.ChainID[:]))
+	}
+
+	r.intentMu.Lock()
+	defer r.intentMu.Unlock()
+
+	if r.intent == nil {
+		r.logger.Debug(
+			"RRR confirmation stale or un-solicited, no current intent",
+			"endid", et.Endorsement.EndorserID.Hex(), "hintent",
+			et.SignedEndorsement.IntentHash.Hex())
+		return nil
+	}
+
+	pendingIntentHash, err := r.codec.HashIntent(&r.intent.SI.Intent)
+	if err != nil {
+		return err
+	}
+
+	if pendingIntentHash != et.SignedEndorsement.IntentHash {
+		r.logger.Debug("RRR confirmation for stale or unknown intent",
+			"pending", pendingIntentHash.Hex(),
+			"received", et.SignedEndorsement.IntentHash.Hex())
+		return nil
+	}
+
+	// Check the confirmation came from an endorser selected by this node for
+	// the current round
+	endorserAddr := et.SignedEndorsement.EndorserID.Address()
+	if !r.endorsers[endorserAddr] {
+		r.logger.Debug(
+			"RRR confirmation from unexpected endorser", "endorser",
+			et.Endorsement.EndorserID[:])
+		return nil
+	}
+
+	// Check the confirmation is not from an endorser that has endorsed our
+	// intent already this round.
+	if r.intent.Endorsers[endorserAddr] {
+		r.logger.Trace(
+			"RRR redundant confirmation from endorser", "endorser",
+			et.Endorsement.EndorserID[:])
+		return nil
+	}
+
+	// Note: *not* copying, engine run owns everything that is passed to it on
+	// the runningCh
+	r.intent.Endorsements = append(r.intent.Endorsements, &et.SignedEndorsement)
+	r.intent.Endorsers[endorserAddr] = true
+
+	if uint64(len(r.intent.Endorsements)) >= r.config.Quorum {
+		r.logger.Trace("RRR confirmation redundant, have quorum",
+			"endid", et.Endorsement.EndorserID.Hex(),
+			"end#", et.SignedEndorsement.IntentHash.Hex(),
+			"hintent", et.SignedEndorsement.IntentHash.Hex())
+	}
+
+	return nil
 }

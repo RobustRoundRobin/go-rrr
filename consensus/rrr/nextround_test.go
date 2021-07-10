@@ -2,7 +2,6 @@ package rrr
 
 import (
 	"fmt"
-	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -68,14 +67,13 @@ func (a *activeSelection) LeaderForRoundAttempt(
 }
 func (a *activeSelection) Reset(head BlockHeader) {
 }
-func (a *activeSelection) Prime(head BlockHeader)        {}
-func (a *activeSelection) YoungestNodeID() Hash          { return Hash{} }
-func (a *activeSelection) AgeOf(nodeID Address) *big.Int { return nil }
-func (a *activeSelection) NumActive() int                { return a.numActive }
-func (a *activeSelection) NumKnown() int                 { return a.numActive }
-func (a *activeSelection) NumIdle() int                  { return 0 }
-func (a *activeSelection) IdleLeader() Address           { return Address{} }
-func (a *activeSelection) IsActive(addr Address) bool    { return true }
+func (a *activeSelection) Prime(head BlockHeader)              {}
+func (a *activeSelection) YoungestNodeID() Hash                { return Hash{} }
+func (a *activeSelection) OldestNodeID() Hash                  { return Hash{} }
+func (a *activeSelection) AgeOf(nodeID Address) (uint64, bool) { return 0, false }
+func (a *activeSelection) NumActive() int                      { return a.numActive }
+func (a *activeSelection) IdleLeader() Address                 { return Address{} }
+func (a *activeSelection) IsActive(addr Address) bool          { return true }
 func TestAlignFailedAttempts(t *testing.T) {
 
 	now := time.Now()

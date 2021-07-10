@@ -47,7 +47,7 @@ type idActivity struct {
 	// ageBlock is the number of the block most recently minted by the
 	// identity OR the block the identity was enrolled on - udpated by
 	// esbalishAge
-	ageBlock *big.Int
+	ageBlock uint64
 
 	// ageRound is the round number the idenity was most recently active in - as per ageBlock
 	ageRound uint64
@@ -58,7 +58,7 @@ type idActivity struct {
 
 	// endorsedBlock is the number of the block most recently endorsed by the
 	// identity
-	endorsedBlock *big.Int
+	endorsedBlock uint64
 	// endorsedRound is the round number that produced the last block endorsed
 	// by the identity.
 	endorsedRound uint64
@@ -107,7 +107,7 @@ type activeList struct {
 	// without matching the hash - that is a branch and we haven't implemented
 	// SelectBranch yet.
 	lastBlockSeen    Hash
-	activeBlockFence *big.Int
+	activeBlockFence uint64
 
 	selfNodeID Hash // for logging only
 	logger     Logger
@@ -146,8 +146,11 @@ type ActiveSelection interface {
 
 	YoungestNodeID() Hash
 
-	// AgeOf returns the age of the identity or nil if it is not known
-	AgeOf(nodeID Address) *big.Int
+	OldestNodeID() Hash
+
+	// AgeOf returns the age of the identity. The boolean return is false if the
+	// identity is not active.
+	AgeOf(nodeID Address) (uint64, bool)
 
 	NumActive() int
 	IsActive(addr Address) bool
@@ -170,14 +173,6 @@ func (a *activeList) NumActive() int {
 	return a.activeSelection.Len()
 }
 
-func (a *activeList) NumKnown() int {
-	return len(a.aged)
-}
-
-func (a *activeList) NumIdle() int {
-	return len(a.newPool)
-}
-
 func (a *activeList) IdleLeader() Address {
 	return a.idleLeader.Address()
 }
@@ -192,15 +187,20 @@ func (a *activeList) YoungestNodeID() Hash {
 	return a.activeSelection.Front().Value.(*idActivity).nodeID
 }
 
+func (a *activeList) OldestNodeID() Hash {
+
+	return a.activeSelection.Back().Value.(*idActivity).nodeID
+}
+
 // AgeOf returns the age of the identity or nil if it is not known
-func (a *activeList) AgeOf(nodeID Address) *big.Int {
+func (a *activeList) AgeOf(nodeID Address) (uint64, bool) {
 	aged, ok := a.aged[nodeID]
 	if !ok {
-		return nil
+		return 0, false
 	}
 
 	// return a copy, it is just to error prone to do otherwise
-	return new(big.Int).Set(aged.Value.(*idActivity).ageBlock)
+	return aged.Value.(*idActivity).ageBlock, true
 }
 
 // Reset resets and primes the active selection such that head - ta is the
@@ -212,7 +212,7 @@ func (a *activeList) Reset(head BlockHeader) {
 	a.newPool = make(map[Address]*idActivity)
 	a.aged = make(map[Address]*list.Element)
 	a.lastBlockSeen = Hash{}
-	a.activeBlockFence = nil
+	a.activeBlockFence = 0
 	a.activeSelection = list.New()
 	a.Prime(head)
 }
@@ -234,11 +234,14 @@ func (a *activeList) Prime(head BlockHeader) {
 	// selectCandidatesAndEndorsers
 
 	// horizon = head - activity
-	headNumber := big.NewInt(0).Set(head.GetNumber())
-	horizon := headNumber.Sub(headNumber, big.NewInt(int64(a.config.Activity)))
-	if horizon.Cmp(big0) < 0 {
-		horizon.SetInt64(0)
+
+	horizon := uint64(0)
+	headNumber := head.GetNumber().Uint64()
+
+	if headNumber > a.config.Activity {
+		horizon = headNumber - a.config.Activity
 	}
+
 	a.activeBlockFence = horizon
 
 	// Notice that we _do not_ record the hash here, we leave that to
@@ -272,8 +275,9 @@ func (a *activeList) AccumulateActive(
 
 	blockActivity := BlockActivity{}
 
-	depth := new(big.Int)
-	headNumber := head.GetNumber()
+	depth := uint64(0)
+	bigHeadNumber := head.GetNumber()
+	headNumber := bigHeadNumber.Uint64()
 	cur := head
 
 	youngestKnown := a.activeSelection.Front()
@@ -309,10 +313,13 @@ func (a *activeList) AccumulateActive(
 		// If we have exceeded the Ta depth horizon we are done. Note we do this
 		// directly on the number in the header and the activity, rather than
 		// relying on the cached activeBlockFence.
-		curNumber := cur.GetNumber()
-		depth.Sub(headNumber, curNumber)
+		curNumber := cur.GetNumber().Uint64()
+		depth = 0
+		if headNumber > curNumber {
+			depth = headNumber - curNumber
+		}
 
-		if !depth.IsUint64() || depth.Uint64() >= a.config.Activity {
+		if depth >= a.config.Activity || curNumber > headNumber {
 			a.logger.Trace("RRR accumulateActive - complete, reached activity depth", "Ta", a.config.Activity)
 
 			// dump all identities whose last activity was before this block
@@ -324,7 +331,7 @@ func (a *activeList) AccumulateActive(
 		// the fence and we haven't matched the hash yet it means we have a
 		// chain re-org. The exception accommodates the first pass after node
 		// startup.
-		if a.lastBlockSeen != zeroHash && curNumber.Cmp(a.activeBlockFence) <= 0 && headNumber.Cmp(big0) != 0 {
+		if a.lastBlockSeen != zeroHash && curNumber <= a.activeBlockFence && headNumber != 0 {
 			// re-orgs are fine provided verifyBranch is working, but we can't
 			// deal with them sensibly here. The expectation is that everything
 			// in aged gets moved to idles then we re-run accumulateActive to
@@ -378,7 +385,10 @@ func (a *activeList) AccumulateActive(
 	}
 
 	// deal with idles
-	activeHorizon := headNumber.Uint64() - a.config.Activity
+	activeHorizon := uint64(0)
+	if headNumber > a.config.Activity {
+		activeHorizon = headNumber - a.config.Activity
+	}
 
 	// We always iterate oldest -> youngest
 	var next *list.Element
@@ -388,13 +398,13 @@ func (a *activeList) AccumulateActive(
 
 		// because we are going oldest to youngest we can break once we find an
 		// identity at or above the horizon.
-		if age.lastActiveBlock().Uint64() >= activeHorizon {
+		if age.lastActiveBlock() >= activeHorizon {
 			break
 		}
 
 		a.logger.Trace("RRR ActiveSelection - identity fell below activity horizon",
 			"gi", age.genesisOrder, "end", age.endorsedBlock,
-			"last", age.lastActiveBlock().Uint64(), "id", age.nodeID.Hex())
+			"last", age.lastActiveBlock(), "id", age.nodeID.Hex())
 
 		a.activeSelection.Remove(cur)
 		delete(a.aged, age.nodeID.Address())
@@ -418,7 +428,7 @@ func (a *activeList) AccumulateActive(
 	oldest.oldestFor += 1
 
 	a.lastBlockSeen = headHash
-	a.activeBlockFence = big.NewInt(0).Set(headNumber)
+	a.activeBlockFence = headNumber
 
 	return nil
 }
@@ -428,10 +438,10 @@ func (a *activeList) logSealerAge(cur BlockHeader, blockActivity *BlockActivity)
 	a.logger.Debug("RRR accumulateActive - sealer",
 		"addr", a.logger.LazyValue(func() string { return blockActivity.SealerID.Address().HexShort() }),
 		"age", a.logger.LazyValue(func() string {
-			curNumber := cur.GetNumber()
+			curNumber := cur.GetNumber().Uint64()
 			if sealer := a.aged[blockActivity.SealerID.Address()]; sealer != nil {
 				age := sealer.Value.(*idActivity)
-				if age.ageBlock.Cmp(curNumber) < 0 {
+				if age.ageBlock < curNumber {
 					return fmt.Sprintf("%d->%d.%02d", age.ageBlock, curNumber, age.order)
 				}
 				return fmt.Sprintf("%05d.%02d", curNumber, age.order)
@@ -483,7 +493,7 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 	}
 
 	a.logger.Trace(
-		"RRR selectCandEs", "na", Na, "agelen", len(a.aged), "idle", len(a.newPool),
+		"RRR selectCandEs", "na", Na, "agelen", len(a.aged),
 		"self", a.selfNodeID.Address().Hex(), "selfID", a.selfNodeID.Hex())
 
 	candidates := make(map[Address]bool)
@@ -605,9 +615,9 @@ func (a *activeList) logSelection(
 }
 
 // lastActiveBlock returns the higher of endorsedBlock and ageBlock
-func (a *idActivity) lastActiveBlock() *big.Int {
+func (a *idActivity) lastActiveBlock() uint64 {
 
-	if a.endorsedBlock.Cmp(a.ageBlock) > 0 {
+	if a.endorsedBlock > a.ageBlock {
 		return a.endorsedBlock
 	}
 	return a.ageBlock
@@ -615,7 +625,7 @@ func (a *idActivity) lastActiveBlock() *big.Int {
 
 func (a *activeList) enrolIdentities(
 	chainID Hash, fence *list.Element, sealerID Hash,
-	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, blockNumber *big.Int, roundNumber uint64,
+	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, blockNumber, roundNumber uint64,
 ) error {
 
 	enbind := EnrolmentBinding{}
@@ -639,7 +649,6 @@ func (a *activeList) enrolIdentities(
 		if u != e.U {
 			// We try with and without re-enrolment set, so hash match isn't an
 			// error
-			a.logger.Debug("RRR enrolIdentities - u != e.U", "u", u.Hex(), "e.U", e.U.Hex())
 			return false, nil
 		}
 
@@ -703,14 +712,14 @@ func (a *activeList) enrolIdentities(
 func newIDActivity(nodeID Hash) *idActivity {
 	return &idActivity{
 		nodeID:        nodeID,
-		ageBlock:      big.NewInt(0),
-		endorsedBlock: big.NewInt(0),
+		ageBlock:      0,
+		endorsedBlock: 0,
 	}
 }
 
 // recordActivity is called for a node to indicate it is active in the current
 // round.
-func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big.Int, roundNumber uint64) *idActivity {
+func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber, roundNumber uint64) *idActivity {
 
 	var aged *idActivity
 	nodeAddr := nodeID.Address()
@@ -729,7 +738,7 @@ func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big
 		a.newPool[nodeAddr] = aged
 	}
 	aged.endorsedHash = endorsed
-	aged.endorsedBlock.Set(blockNumber)
+	aged.endorsedBlock = blockNumber
 	aged.endorsedRound = roundNumber
 
 	return aged
@@ -746,7 +755,7 @@ func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber *big
 // preserve the order we just need to PushBack, each identity encountered is
 // 'older' than the previous
 func (a *activeList) refreshAge(
-	fence *list.Element, nodeID Hash, block Hash, blockNumber *big.Int, roundNumber uint64, order int,
+	fence *list.Element, nodeID Hash, block Hash, blockNumber, roundNumber uint64, order int,
 ) {
 	var aged *idActivity
 
@@ -760,7 +769,7 @@ func (a *activeList) refreshAge(
 		// have already processed it and it is in the appropriate place.
 		// But note if we have a re-org, ageBlock *can* be from the 'other'
 		// branch and so > head. The aged pool needs to be re-set for a re-org.
-		if aged.ageBlock.Cmp(blockNumber) <= 0 {
+		if aged.ageBlock <= blockNumber {
 
 			a.logger.Trace("RRR refreshAge - move",
 				"fenced", bool(fence != nil), "addr", nodeAddr.HexShort(), "age",
@@ -773,7 +782,7 @@ func (a *activeList) refreshAge(
 				// Here we are assuming the list started *empty*
 				a.activeSelection.MoveToBack(el)
 			}
-			aged.ageBlock.Set(blockNumber)
+			aged.ageBlock = blockNumber
 			aged.ageRound = roundNumber
 			aged.ageHash = block
 			aged.oldestFor = 0
@@ -797,7 +806,7 @@ func (a *activeList) refreshAge(
 		}
 		delete(a.newPool, nodeAddr)
 
-		aged.ageBlock.Set(blockNumber)
+		aged.ageBlock = blockNumber
 		aged.ageRound = roundNumber
 		aged.ageHash = block
 		aged.oldestFor = 0
@@ -810,7 +819,6 @@ func (a *activeList) refreshAge(
 			// Here we are assuming the list started *empty*
 			a.aged[nodeAddr] = a.activeSelection.PushBack(aged)
 		}
-
 	}
 
 	// Setting ageBlock resets the age of the identity. The test for active is
@@ -818,7 +826,7 @@ func (a *activeList) refreshAge(
 	// then it is still considered 'active' if ageBlock is inside Ta.
 	// Re-enrolment is how the current leader re-activates idle identities.
 
-	if blockNumber.Cmp(big0) == 0 {
+	if blockNumber == 0 {
 		aged.genesisOrder = order
 	}
 }
