@@ -72,7 +72,7 @@ func (a *activeSelection) YoungestNodeID() Hash                { return Hash{} }
 func (a *activeSelection) OldestNodeID() Hash                  { return Hash{} }
 func (a *activeSelection) AgeOf(nodeID Address) (uint64, bool) { return 0, false }
 func (a *activeSelection) NumActive() int                      { return a.numActive }
-func (a *activeSelection) IdleLeader() Address                 { return Address{} }
+func (a *activeSelection) IdleLeaders() []Hash                 { return nil }
 func (a *activeSelection) IsActive(addr Address) bool          { return true }
 func TestAlignFailedAttempts(t *testing.T) {
 
