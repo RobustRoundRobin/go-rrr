@@ -371,6 +371,49 @@ func (r *EndorsmentProtocol) setChainHead(chain EngineChainReader, head BlockHea
 	return nil
 }
 
+// reEnrolIdleLeaders will queue enrolments for all the leaders that became idle
+// in the last call to AccumulateActive. Use this if the number of active
+// identities has fallen to low to avoid the network loosing its minimum quorum
+// for consensus.
+func (r *EndorsmentProtocol) idleLeaderQuorumMitigation() {
+
+	// If this node is not in the active set, automatically issue a re-enrol.
+	// Leader candidates are culled as idle if they are oldest for Nc rounds.
+	// That is quite an agressive standard. Operators could do this but it would
+	// effectively require them all to open up the rpc ports in order to
+	// guarantee a stable network. Note that we *always* do this. THis is the
+	// idled node declaring itself active by imediately re-enroling.
+
+	// first reset it, if we are now  active no need to keep trying to enrol.
+	r.reEnrolSelf = false
+	if !r.a.IsActive(r.nodeAddr) {
+		r.logger.Info(
+			"RRR accumualteActive - self not in active, initiate re-enrol", "self", r.nodeAddr.Hex())
+		r.reEnrolSelf = true
+	}
+
+	// Now consider re-enroling identities un conditionaly. We only do this when
+	// the number of active identities is low enough to risk the consensus
+	// quorum.
+	if r.a.NumActive() > (int(r.config.Candidates) + int(r.config.Endorsers)) {
+		return
+	}
+
+	idledLeaders := r.a.IdleLeaders()
+	if len(idledLeaders) == 0 {
+		r.logger.Info(
+			"RRR idleLeaderQuorumMitigation - warning: low number of active identities", "r", r.Number)
+	}
+
+	r.logger.Info(
+		"RRR accumulateActive - na < nc+ en. auto re-enroling idle leaders.",
+		"r", r.Number, "na", r.a.NumActive(), "num-renrol", len(idledLeaders))
+
+	for _, nodeId := range idledLeaders {
+		r.QueueEnrolment(&EngEnrolIdentity{NodeID: nodeId, ReEnrol: true})
+	}
+}
+
 func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head BlockHeader) error {
 
 	// Establish the order of identities in the round robin selection. Age is
@@ -380,7 +423,9 @@ func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head Bloc
 	// round.
 	err := r.a.AccumulateActive(
 		r.genesisEx.ChainID, chain, head)
+
 	if err == nil {
+		r.idleLeaderQuorumMitigation()
 		return nil
 	}
 	if !errors.Is(err, ErrBranchDetected) {
@@ -394,22 +439,10 @@ func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head Bloc
 
 	if err := r.a.AccumulateActive(
 		r.genesisEx.ChainID, chain, head); err == nil {
+		r.idleLeaderQuorumMitigation()
 		return nil
 	}
 
-	// If this node is not in the active set, automatically issue a re-enrol.
-	// Leader candidates are culled as idle if they are oldest for Nc rounds.
-	// That is quite an agressive standard. Operators could do this but it would
-	// effectively require them all to open up the rpc ports in order to
-	// guarantee a stable network.
-
-	// first reset it, if we are now  active no need to keep trying to enrol.
-	r.reEnrolSelf = false
-	if !r.a.IsActive(r.nodeAddr) {
-		r.logger.Info(
-			"RRR accumualteActive - self not in active, initiate re-enrol", "self", r.nodeAddr)
-		r.reEnrolSelf = true
-	}
 	r.logger.Warn(
 		"RRR resetActive failed to recover from re-org", "err", err)
 	return err

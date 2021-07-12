@@ -92,9 +92,9 @@ type activeList struct {
 	activeSelection *list.List                // list of *idActive
 	aged            map[Address]*list.Element // map of NodeID.Addresss() -> Element in active
 
-	// idleLeader stores the address of the leader removed by AccumulateActive
-	// due to being oldest to many times, or the zero address
-	idleLeader Hash
+	// idledLeaders stores the address of the leaders removed by the most
+	// recent call to AccumulateActive due to being oldest to many times.
+	idleLeaders map[Hash]bool
 
 	// Because AccumulateActive processes the chain from HEAD -> genesis, we can
 	// encounter endorsments before we see the enrolment. To accomodate this we
@@ -121,13 +121,13 @@ type ActiveSelection interface {
 		chainID Hash, chain blockHeaderReader, head BlockHeader,
 	) error
 
-	// IdleLeader the zero address or the oldest identity removed by
-	// AccumulateActive due to being oldest for too long.When the number of
-	// active identities is below Nc +Ne this can impare the network. If it
-	// falls below Nc + Q, the network halts. To aoid this situation, leader
-	// candidates automatically re-enrol the address returned by this function
-	// if we have <= Nc+Ne active identities.
-	IdleLeader() Address
+	// IdleLeaders are the NodeID's of the leaders made idle in the last call
+	// to ActiveSelection due to the idle leader rule. When the number of
+	// active identities is below Nc +Ne these identities should be
+	// automatically re-enroled by the next leader. This is to prevent the
+	// network falling below the quorum, at which point it would halt. Note
+	// that this is reset each time AccumulateActive is called.
+	IdleLeaders() []Hash
 
 	// SelectCandidatesAndEndorsers should be called once a round with a fresh
 	// permutation of indices into the active selection. There must be exactly
@@ -173,8 +173,12 @@ func (a *activeList) NumActive() int {
 	return a.activeSelection.Len()
 }
 
-func (a *activeList) IdleLeader() Address {
-	return a.idleLeader.Address()
+func (a *activeList) IdleLeaders() []Hash {
+	idles := make([]Hash, 0, len(a.idleLeaders))
+	for id := range a.idleLeaders {
+		idles = append(idles, id)
+	}
+	return idles
 }
 
 func (a *activeList) IsActive(addr Address) bool {
@@ -270,8 +274,7 @@ func (a *activeList) AccumulateActive(
 		return nil
 	}
 
-	// ok, its a new block, reset idleLeader
-	a.idleLeader = Hash{}
+	a.idleLeaders = make(map[Hash]bool)
 
 	blockActivity := BlockActivity{}
 
@@ -377,6 +380,26 @@ func (a *activeList) AccumulateActive(
 			break
 		}
 
+		// For each block considered we need to apply the idle rule for non
+		// responsive leaders.
+		Nc := int(a.config.Candidates)
+		oldest := a.activeSelection.Back().Value.(*idActivity)
+		if oldest.oldestFor > Nc && oldest.oldestFor > int(a.config.MinIdleAttempts) {
+
+			a.logger.Debug("RRR ActiveSelection - droping unresponsive leader",
+				"bn", curNumber, "nodeid", oldest.nodeID.Address().Hex(), "oldestFor", oldest.oldestFor)
+
+			a.activeSelection.Remove(a.activeSelection.Back())
+			delete(a.aged, oldest.nodeID.Address())
+
+			// If we are now Na <= Nc+Q+1 leaders are required to include this
+			// identity in there next block as an enrolment.
+			a.idleLeaders[oldest.nodeID] = true
+		}
+		// Note: oldesFor is zeroed by refreshAge. Which is called above for
+		// signers and also by enrolIdentities.
+		oldest.oldestFor += 1
+
 		cur = chain.GetHeaderByHash(parentHash)
 
 		if cur == nil {
@@ -409,23 +432,6 @@ func (a *activeList) AccumulateActive(
 		a.activeSelection.Remove(cur)
 		delete(a.aged, age.nodeID.Address())
 	}
-
-	Nc := int(a.config.Candidates)
-
-	oldest := a.activeSelection.Back().Value.(*idActivity)
-	if oldest.oldestFor > Nc && oldest.oldestFor > int(a.config.MinIdleAttempts) {
-
-		a.logger.Debug("RRR selectCandEs - droping unresponsive leader",
-			"nodeid", oldest.nodeID.Address().Hex(), "oldestFor", oldest.oldestFor)
-
-		a.activeSelection.Remove(a.activeSelection.Back())
-		delete(a.aged, oldest.nodeID.Address())
-
-		// If we are now Na <= Nc+Q+1 leaders are required to include this
-		// identity in there next block as an enrolment.
-		a.idleLeader = oldest.nodeID
-	}
-	oldest.oldestFor += 1
 
 	a.lastBlockSeen = headHash
 	a.activeBlockFence = headNumber

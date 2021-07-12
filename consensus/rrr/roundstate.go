@@ -281,7 +281,7 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 // QueueEnrolment enrols a node id. This enrolment is completely open. The SGX
 // identity attestation and the minining identity approaches are not presently
 // included.
-func (r *EndorsmentProtocol) QueueEnrolment(et *EngEnrolIdentity) error {
+func (r *EndorsmentProtocol) QueueEnrolment(et *EngEnrolIdentity) {
 	r.pendingEnrolmentsMu.Lock()
 	defer r.pendingEnrolmentsMu.Unlock()
 
@@ -300,7 +300,6 @@ func (r *EndorsmentProtocol) QueueEnrolment(et *EngEnrolIdentity) error {
 	eb.Round = r.Number
 
 	r.pendingEnrolments[et.NodeID] = eb
-	return nil
 }
 
 // IsEnrolmentPending returns true if there is an enrolment request queued for
