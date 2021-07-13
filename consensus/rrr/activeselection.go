@@ -383,22 +383,24 @@ func (a *activeList) AccumulateActive(
 		// For each block considered we need to apply the idle rule for non
 		// responsive leaders.
 		Nc := int(a.config.Candidates)
-		oldest := a.activeSelection.Back().Value.(*idActivity)
-		if oldest.oldestFor > Nc && oldest.oldestFor > int(a.config.MinIdleAttempts) {
+		if a.activeSelection.Len() > 0 {
+			oldest := a.activeSelection.Back().Value.(*idActivity)
+			if oldest.oldestFor > Nc && oldest.oldestFor > int(a.config.MinIdleAttempts) {
 
-			a.logger.Debug("RRR ActiveSelection - droping unresponsive leader",
-				"bn", curNumber, "nodeid", oldest.nodeID.Address().Hex(), "oldestFor", oldest.oldestFor)
+				a.logger.Debug("RRR ActiveSelection - droping unresponsive leader",
+					"bn", curNumber, "nodeid", oldest.nodeID.Address().Hex(), "oldestFor", oldest.oldestFor)
 
-			a.activeSelection.Remove(a.activeSelection.Back())
-			delete(a.aged, oldest.nodeID.Address())
+				a.activeSelection.Remove(a.activeSelection.Back())
+				delete(a.aged, oldest.nodeID.Address())
 
-			// If we are now Na <= Nc+Q+1 leaders are required to include this
-			// identity in there next block as an enrolment.
-			a.idleLeaders[oldest.nodeID] = true
+				// If we are now Na <= Nc+Q+1 leaders are required to include this
+				// identity in there next block as an enrolment.
+				a.idleLeaders[oldest.nodeID] = true
+			}
+			// Note: oldesFor is zeroed by refreshAge. Which is called above for
+			// signers and also by enrolIdentities.
+			oldest.oldestFor += 1
 		}
-		// Note: oldesFor is zeroed by refreshAge. Which is called above for
-		// signers and also by enrolIdentities.
-		oldest.oldestFor += 1
 
 		cur = chain.GetHeaderByHash(parentHash)
 
