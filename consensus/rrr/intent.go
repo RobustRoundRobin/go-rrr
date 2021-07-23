@@ -10,6 +10,12 @@ type Intent struct {
 	ChainID Hash
 	// NodeID is Keccak256 ( PublicKey X || Y )
 	NodeID Hash
+
+	// The oldest identity in the active selection derived from the branch
+	// starting at the parent of the proposed block. This makes it more
+	// efficient to determine if leader candidates are idle.
+	OldestID Hash
+
 	// RoundNumber is the block number proposed.
 	RoundNumber uint64
 	// ParentHash parent block hash
@@ -39,7 +45,7 @@ type SignedIntent struct {
 	Sig [65]byte
 }
 
-// EncodSignIntent encodes the intent body, signs the result and returns the
+// EncodeSignIntent encodes the intent body, signs the result and returns the
 // serialised encoding of the result. k will typically be a leader candidate
 // private key.
 func (codec *CipherCodec) EncodeSignIntent(i *SignedIntent, k *ecdsa.PrivateKey) ([]byte, error) {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 )
 
@@ -63,11 +64,6 @@ type idActivity struct {
 	// by the identity.
 	endorsedRound uint64
 
-	// oldestFor - the number of rounds the identity has been found to be the
-	// oldest. Reset only after the identity mints a block. Excludes inactive
-	// identities from candidate selection -- 5.1 "Candidate and Endorser Selection"
-	oldestFor int
-
 	// order in the block that the identities enrolment appeared.  The first
 	// time an identity is selected, it has not minted so it is conceivable
 	// that its 'age' is the same as another leader candidate (because they
@@ -79,6 +75,8 @@ type idActivity struct {
 	// genesiOrder is for telemetry, it is (or will be) undefined for nodes
 	// whose initial enrol is not in the genesis block.
 	genesisOrder int
+
+	oldestFor int
 }
 
 // activeList tracks the active identities and facilitates ordering them by
@@ -277,6 +275,7 @@ func (a *activeList) AccumulateActive(
 	a.idleLeaders = make(map[Hash]bool)
 
 	blockActivity := BlockActivity{}
+	var headActivity BlockActivity
 
 	depth := uint64(0)
 	bigHeadNumber := head.GetNumber()
@@ -350,6 +349,10 @@ func (a *activeList) AccumulateActive(
 
 		a.logSealerAge(cur, &blockActivity)
 
+		if h == headHash {
+			headActivity = blockActivity
+		}
+
 		// Do any enrolments. (Re) Enrolling an identity moves it to the
 		// youngest position in the activity set
 		a.enrolIdentities(
@@ -380,28 +383,6 @@ func (a *activeList) AccumulateActive(
 			break
 		}
 
-		// For each block considered we need to apply the idle rule for non
-		// responsive leaders.
-		Nc := int(a.config.Candidates)
-		if a.activeSelection.Len() > 0 {
-			oldest := a.activeSelection.Back().Value.(*idActivity)
-			if oldest.oldestFor > Nc && oldest.oldestFor > int(a.config.MinIdleAttempts) {
-
-				a.logger.Debug("RRR ActiveSelection - droping unresponsive leader",
-					"bn", curNumber, "nodeid", oldest.nodeID.Address().Hex(), "oldestFor", oldest.oldestFor)
-
-				a.activeSelection.Remove(a.activeSelection.Back())
-				delete(a.aged, oldest.nodeID.Address())
-
-				// If we are now Na <= Nc+Q+1 leaders are required to include this
-				// identity in there next block as an enrolment.
-				a.idleLeaders[oldest.nodeID] = true
-			}
-			// Note: oldesFor is zeroed by refreshAge. Which is called above for
-			// signers and also by enrolIdentities.
-			oldest.oldestFor += 1
-		}
-
 		cur = chain.GetHeaderByHash(parentHash)
 
 		if cur == nil {
@@ -415,30 +396,156 @@ func (a *activeList) AccumulateActive(
 		activeHorizon = headNumber - a.config.Activity
 	}
 
+	idleGap := int(a.config.Candidates)
+	if a.config.MinIdleAttempts > a.config.Candidates {
+		idleGap = int(a.config.MinIdleAttempts)
+	}
+
+	a.logger.Trace("RRR accumulateActive - for block", "block-r", headActivity.RoundNumber, "bn", headNumber, "#", headHash.Hex())
 	// We always iterate oldest -> youngest
 	var next *list.Element
 	for cur, end := a.activeSelection.Back(), a.activeSelection.Front(); cur != end; cur = next {
 		next = cur.Prev()
 		age := cur.Value.(*idActivity)
+		if age == nil {
+			a.logger.Crit("wtf?")
+		}
 
-		// because we are going oldest to youngest we can break once we find an
-		// identity at or above the horizon.
-		if age.lastActiveBlock() >= activeHorizon {
+		if age.lastActiveBlock() < activeHorizon {
+
+			a.logger.Trace("RRR Accumulate Active - identity fell below activity horizon",
+				"gi", age.genesisOrder, "end", age.endorsedBlock,
+				"last", age.lastActiveBlock(), "id", age.nodeID.Address().Hex())
+
+			a.activeSelection.Remove(cur)
+			delete(a.aged, age.nodeID.Address())
+			continue
+		}
+
+		if next == nil {
 			break
 		}
 
-		a.logger.Trace("RRR ActiveSelection - identity fell below activity horizon",
-			"gi", age.genesisOrder, "end", age.endorsedBlock,
-			"last", age.lastActiveBlock(), "id", age.nodeID.Hex())
+		// identities only move if they seal or are enroled. When they move the
+		// ageBlock is updated and will be in sequence with their imediate
+		// successor. So gaps are always due to the oldest identity failing to
+		// produce a block. Note that identities enroled on the same block will
+		// have the same block age.
+
+		nextAge := next.Value.(*idActivity)
+
+		var oldestFor int
+
+		if nextAge.ageBlock != age.ageBlock {
+			oldestFor = int(nextAge.ageBlock - age.ageBlock)
+			a.logger.Debug(
+				"RRR AccumulateActive - oldestFor",
+				"of", oldestFor, "a", age.ageBlock, "a-next", nextAge.ageBlock, "id", age.nodeID.Address().Hex())
+		} else {
+			oldestFor = int(nextAge.order - age.order)
+			a.logger.Debug(
+				"RRR AccumulateActive - oldestFor (ageBlock tie)",
+				"of", oldestFor, "a", age.ageBlock, "o", age.order, "o-next", nextAge.order, "id", age.nodeID.Address().Hex())
+		}
+
+		if oldestFor < idleGap {
+			continue
+		}
+
+		a.logger.Debug("RRR Accumulate Active - found unresponsive leader, droping",
+			"bn", headNumber, "id", age.nodeID.Address().Hex(), "oldestFor", oldestFor)
 
 		a.activeSelection.Remove(cur)
 		delete(a.aged, age.nodeID.Address())
+
+		// If we are now Na <= Nc+Q+1 leaders are required to include this
+		// identity in there next block as an enrolment.
+		a.idleLeaders[age.nodeID] = true
 	}
 
 	a.lastBlockSeen = headHash
 	a.activeBlockFence = headNumber
 
+	a.logSelectionOrder(head, &headActivity)
+
 	return nil
+}
+
+type selectionItem struct {
+	act *idActivity
+	pos int
+}
+
+type ByAge []selectionItem
+
+func (a ByAge) Len() int { return len(a) }
+func (a ByAge) Less(i, j int) bool {
+	// the identity with lowest enrol order in same block is older
+	if a[i].act.ageBlock == a[j].act.ageBlock {
+		return a[i].act.order < a[j].act.order
+	}
+	return a[i].act.ageBlock < a[j].act.ageBlock
+}
+
+func (a ByAge) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
+func (a *activeList) logSelectionOrder(head BlockHeader, headActivity *BlockActivity) {
+
+	// last item is always nil
+	active := make([]selectionItem, a.activeSelection.Len())
+	logs := make([]string, a.activeSelection.Len())
+
+	pos := 0
+	for cur, end := a.activeSelection.Back(), a.activeSelection.Front(); cur != end; cur = cur.Prev() {
+		active[pos].act = cur.Value.(*idActivity)
+		active[pos].pos = pos
+
+		if headActivity.OldestID == active[pos].act.nodeID {
+			logs[pos] = fmt.Sprintf("|%d %s|", active[pos].act.ageBlock, active[pos].act.nodeID.Address().HexShort())
+		} else {
+			// logs[pos] = fmt.Sprintf("p:%d a:%d ", pos, active[pos].act.ageBlock)
+			logs[pos] = fmt.Sprintf("%d %s", active[pos].act.ageBlock, active[pos].act.nodeID.Address().HexShort())
+		}
+		pos++
+	}
+	active = active[:pos] // trim off nil items
+
+	sort.Sort(ByAge(active))
+
+	// Is the oldest correct
+	if active[0].pos != 0 {
+
+		// find the entry we expected to be the oldest (lowest ageBlock)
+		var expectedPos0 int
+		for expectedPos0 = 0; expectedPos0 < len(active); expectedPos0++ {
+			if active[expectedPos0].pos == 0 {
+				break
+			}
+		}
+		a.logger.Info(
+			"RRR accumulateActive - oldest in queue wrong, have",
+			"p", active[0].pos, "a", active[0].act.ageBlock, "id", active[0].act.nodeID.Address().Hex())
+		a.logger.Info(
+			"RRR accumulateActive - oldest in queue wrong, expected",
+			"p", active[expectedPos0].pos, "a", active[expectedPos0].act.ageBlock, "id", active[expectedPos0].act.nodeID.Address().Hex())
+	}
+
+	// is the full order correct ?
+	sortedLogs := make([]string, len(active))
+	wasSorted := true
+	for i := 0; i < len(active); i++ {
+		sortedLogs[i] = fmt.Sprintf("%d %s", active[i].act.ageBlock, active[i].act.nodeID.Address().HexShort())
+		if active[i].pos != i {
+			wasSorted = false
+		}
+	}
+	if !wasSorted {
+		// one or more are out of place
+		a.logger.Info("RRR accumulateActive - queue not age ordered, have",
+			"a", strings.Join(logs, ", "))
+		a.logger.Info("RRR accumulateActive - queue not age ordered, expected",
+			"a", strings.Join(sortedLogs, ", "))
+	}
 }
 
 func (a *activeList) logSealerAge(cur BlockHeader, blockActivity *BlockActivity) {
@@ -529,7 +636,8 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 		a.logger.Debug(
 			"RRR selectCandEs - select",
 			"cand", fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.genesisOrder),
-			"ic", len(candidates)-1, "a", age.lastActiveBlock())
+			"ic", len(candidates)-1, "a", age.lastActiveBlock(),
+			"ar", age.ageRound)
 		// Note: divergence (1) leader candidates can not be endorsers
 
 		icur++
@@ -680,8 +788,10 @@ func (a *activeList) enrolIdentities(
 	// (resuting in oldest <- youngest order)
 	for i := 0; i < len(enrolments); i++ {
 
-		order := len(enrolments) - i - 1 // the last enrolment is the youngest
-		enr := enrolments[order]
+		// Note that the "oldest" order for an enrolee is 1. The block sealer
+		// gets order = 0
+		order := len(enrolments) - i // the last enrolment is the youngest
+		enr := enrolments[order-1]
 
 		// the usual case once we are up and running is re-enrolment so we try
 		// it first.
@@ -793,7 +903,6 @@ func (a *activeList) refreshAge(
 			aged.ageBlock = blockNumber
 			aged.ageRound = roundNumber
 			aged.ageHash = block
-			aged.oldestFor = 0
 			aged.order = order
 		}
 
@@ -817,7 +926,6 @@ func (a *activeList) refreshAge(
 		aged.ageBlock = blockNumber
 		aged.ageRound = roundNumber
 		aged.ageHash = block
-		aged.oldestFor = 0
 		aged.order = order
 
 		if fence != nil {

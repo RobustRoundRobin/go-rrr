@@ -465,7 +465,9 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 	r.signedIntent = nil
 
 	r.logger.Info(
-		"RRR ACTIVE SAMPLE >>>>>>>>>", "s", r.activeSample, "r", r.Number)
+		"RRR ACTIVE SAMPLE >>>>>>>>>",
+		"s", r.activeSample, "ns", r.drng.NumSamplesRead(),
+		"r", r.Number, "bn", r.chainHead.GetNumber(), "#head", Hash(r.chainHead.Hash()).Hex())
 
 	sort.Ints(r.activeSample)
 
@@ -511,7 +513,7 @@ func (r *EndorsmentProtocol) updateStableSeed(
 	if err != nil {
 		return err
 	}
-	r.Rand = randFromSeed(roundSeed)
+	r.drng = randFromSeed(roundSeed)
 	r.FailedAttempts = 0 // because we just set the seed
 	r.setRoundForTime(now)
 
@@ -613,22 +615,27 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 
 	if r.a.NumActive() <= int(r.config.Endorsers) {
 		r.logger.Debug(
-			"RRR alignFailedAttempts - noop, na < ne",
-			"na", r.a.NumActive())
+			"RRR alignFailedAttempts - noop, a < ne",
+			"a", r.a.NumActive())
 		return f
 	}
 
-	perms := ""
 	var i uint32
-	for i = fprevious; i < f; i++ {
+	for i = fprevious; i < f-1; i++ {
 		r.activeSample = r.nextActiveSample(r.activeSample)
-		perms = perms + fmt.Sprintf("%v", r.activeSample)
-	}
-	if f > fprevious+1 {
 		r.logger.Debug(
-			"RRR DRGB CATCHUP  ...........", "p", perms, "na",
-			r.a.NumActive(), "r", r.Number, "df", fprevious-f)
+			"RRR DRGB CATCHUP  ...........",
+			"r", r.Number, "s", r.activeSample,
+			"a", r.a.NumActive(), "i", i)
 	}
+
+	// Always do one
+	r.activeSample = r.nextActiveSample(r.activeSample)
+	r.logger.Debug(
+		"RRR DRGB SAMPLE   ...........",
+		"r", r.Number, "ns", r.drng.NumSamplesRead(), "s", r.activeSample,
+		"a", r.a.NumActive(), "df", f-fprevious)
+
 	return f
 }
 
@@ -667,14 +674,16 @@ func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 	// and evict randomly chosen elements.
 	if nactive < nsamples*2 {
 
-		s = make([]int, nactive)
+		// Note: we cant optimise this by using nactive, because we need to
+		// guarantee a deterministic number of samples are taken
+		s = make([]int, nsamples*2)
 
-		for i := 0; i < nactive; i++ {
+		for i := 0; i < nsamples*2; i++ {
 			s[i] = i
 		}
 
 		for len(s) > nsamples {
-			rv := r.Rand.Intn(len(s))
+			rv := r.drng.Intn(len(s))
 
 			// move selected to end then remove then shorten the slice by 1
 			s[rv], s[len(s)-1] = s[len(s)-1], s[rv]
@@ -687,7 +696,7 @@ func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 	for i := 0; i < nsamples; i++ {
 		var rv int
 		for {
-			rv = r.Rand.Intn(nactive)
+			rv = r.drng.Intn(nactive)
 			if indices[rv] {
 				continue
 			}
@@ -756,8 +765,26 @@ func (r *EndorsmentProtocol) electAndPropose(b Broadcaster) {
 	r.broadcastCurrentIntent(b)
 }
 
-func randFromSeed(seed uint64) *rand.Rand {
-	return rand.New(rand.NewSource(int64(seed)))
+type drng struct {
+	*rand.Rand
+	nSamples int
+}
+
+func (r *drng) Intn(n int) int {
+	sample := r.Rand.Intn(n)
+	r.nSamples++
+	return sample
+}
+
+func (r *drng) NumSamplesRead() int {
+	return r.nSamples
+}
+
+func randFromSeed(seed uint64) dRNG {
+	r := drng{
+		Rand: rand.New(rand.NewSource(int64(seed))),
+	}
+	return &r
 }
 
 // ConditionSeed takes a 32 byte input and XOR's it into a single uint64

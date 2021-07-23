@@ -143,6 +143,7 @@ func (r *EndorsmentProtocol) newPendingIntent(
 		Intent: Intent{
 			ChainID:     r.genesisEx.ChainID,
 			NodeID:      r.nodeID,
+			OldestID:    r.a.OldestNodeID(),
 			RoundNumber: roundNumber,
 			ParentHash:  Hash(et.BlockHeader.GetParentHash()),
 			TxHash:      Hash(et.BlockHeader.GetTxHash()), // the hash is computed by NewBlock

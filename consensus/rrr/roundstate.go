@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -69,6 +68,11 @@ type headerByHashChainReader interface {
 	GetHeaderByHash([32]byte) BlockHeader
 }
 
+type dRNG interface {
+	Intn(n int) int
+	NumSamplesRead() int
+}
+
 // EndorsmentProtocol implements  5.2 "Endorsement Protocol" and 5.3 "Chain
 // Validation" (from the paper)
 type EndorsmentProtocol struct {
@@ -99,7 +103,7 @@ type EndorsmentProtocol struct {
 	vrf ecvrf.VRF
 	T   RoundTime
 
-	Rand *rand.Rand
+	drng dRNG
 	// Updated in the NewChainHead method
 	chainHead            BlockHeader
 	chainHeadExtraHeader *ExtraHeader     // genesis & consensus blocks
@@ -405,6 +409,25 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 		r.logger.Debug(
 			"RRR handleIntent - intent from non-candidate",
 			"round", r.Number, "cand", intenderAddr.Hex())
+		return nil
+	}
+
+	// Check that the OldestID is also a candidate and is currently oldest in
+	// this nodes active selection
+	if !r.candidates[et.OldestID.Address()] {
+		r.logger.Debug(
+			"RRR handleIntent - intent OldestID is not a candidate",
+			"round", r.Number, "cand", intenderAddr.Hex(), "oldest", et.OldestID.Address().Hex())
+		return nil
+	}
+
+	if et.OldestID != r.a.OldestNodeID() {
+		r.logger.Debug(
+			"RRR handleIntent - intent OldestID is not oldest in local selection",
+			"round", r.Number, "cand", intenderAddr.Hex(),
+			"oldest", et.OldestID.Address().Hex(),
+			"local-oldest", r.a.OldestNodeID().Address().Hex(),
+		)
 		return nil
 	}
 
