@@ -9,7 +9,6 @@ type BlockActivity struct {
 	Enrol       []Enrolment
 	SealerID    Hash
 	SealerPub   []byte
-	OldestID    Hash
 	RoundNumber uint64
 }
 
@@ -24,7 +23,6 @@ func (codec *CipherCodec) DecodeBlockActivity(a *BlockActivity, chainID Hash, he
 	a.Enrol = nil
 	a.SealerID = Hash{}
 	a.SealerPub = nil
-	a.OldestID = Hash{}
 
 	// Common and fast path first
 	if header.GetNumber().Cmp(big0) > 0 {
@@ -34,7 +32,6 @@ func (codec *CipherCodec) DecodeBlockActivity(a *BlockActivity, chainID Hash, he
 		}
 		a.Confirm = se.ExtraData.Confirm
 		a.Enrol = se.ExtraData.Enrol
-		a.OldestID = se.Intent.OldestID
 		a.RoundNumber = se.Intent.RoundNumber
 		return nil
 	}
@@ -61,7 +58,6 @@ func (codec *CipherCodec) DecodeBlockActivity(a *BlockActivity, chainID Hash, he
 	}
 
 	copy(a.SealerID[:], codec.c.Keccak256(a.SealerPub[1:65]))
-	a.OldestID = a.SealerID
 
 	a.Confirm = []Endorsement{}
 	a.Enrol = ge.Enrol

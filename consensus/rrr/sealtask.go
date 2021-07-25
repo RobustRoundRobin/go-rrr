@@ -143,7 +143,6 @@ func (r *EndorsmentProtocol) newPendingIntent(
 		Intent: Intent{
 			ChainID:     r.genesisEx.ChainID,
 			NodeID:      r.nodeID,
-			OldestID:    r.a.OldestNodeID(),
 			RoundNumber: roundNumber,
 			ParentHash:  Hash(et.BlockHeader.GetParentHash()),
 			TxHash:      Hash(et.BlockHeader.GetTxHash()), // the hash is computed by NewBlock
@@ -274,7 +273,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(beta, pi []byte, chain sealChainRe
 		r.codec.FillEnrolmentQuote(data.Enrol[i].Q[:], u, r.privateKey) // faux attestation
 		data.Enrol[i].U = u
 		data.Enrol[i].ID = eb.NodeID
-		r.logger.Debug("RRR sealCurrentBlock - adding enrolment", "id", eb.NodeID.Hex(), "seal#", eb.BlockHash.Hex(), "u", u.Hex())
+		r.logger.Debug("RRR sealCurrentBlock - adding enrolment", "id", eb.NodeID.Address().Hex(), "seal#", eb.BlockHash.Hex(), "u", u.Hex())
 		i++
 	}
 	r.pendingEnrolments = make(map[Hash]*EnrolmentBinding)

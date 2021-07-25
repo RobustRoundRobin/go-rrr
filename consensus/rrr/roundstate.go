@@ -412,25 +412,6 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 		return nil
 	}
 
-	// Check that the OldestID is also a candidate and is currently oldest in
-	// this nodes active selection
-	if !r.candidates[et.OldestID.Address()] {
-		r.logger.Debug(
-			"RRR handleIntent - intent OldestID is not a candidate",
-			"round", r.Number, "cand", intenderAddr.Hex(), "oldest", et.OldestID.Address().Hex())
-		return nil
-	}
-
-	if et.OldestID != r.a.OldestNodeID() {
-		r.logger.Debug(
-			"RRR handleIntent - intent OldestID is not oldest in local selection",
-			"round", r.Number, "cand", intenderAddr.Hex(),
-			"oldest", et.OldestID.Address().Hex(),
-			"local-oldest", r.a.OldestNodeID().Address().Hex(),
-		)
-		return nil
-	}
-
 	if r.signedIntent != nil {
 		// It must be in the map if it was active, otherwise we have a
 		// programming error.

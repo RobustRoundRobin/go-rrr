@@ -11,11 +11,6 @@ type Intent struct {
 	// NodeID is Keccak256 ( PublicKey X || Y )
 	NodeID Hash
 
-	// The oldest identity in the active selection derived from the branch
-	// starting at the parent of the proposed block. This makes it more
-	// efficient to determine if leader candidates are idle.
-	OldestID Hash
-
 	// RoundNumber is the block number proposed.
 	RoundNumber uint64
 	// ParentHash parent block hash
