@@ -479,7 +479,7 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 
 	r.logger.Info(
 		"RRR ACTIVE SAMPLE >>>>>>>>>",
-		"s", r.activeSample, "ns", r.drng.NumSamplesRead(),
+		"s", r.activeSample, "ns", r.selectionRand.NumSamplesRead(),
 		"r", r.Number, "bn", r.chainHead.GetNumber(), "#head", Hash(r.chainHead.Hash()).Hex())
 
 	sort.Ints(r.activeSample)
@@ -493,13 +493,13 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 
 	// How many endorsing peers are online - check this regardles of
 	// leadership status.
-	r.OnlineEndorsers = b.FindPeers(r.endorsers)
+	r.onlineEndorsers = b.FindPeers(r.endorsers)
 
 	// XXX: TODO if we are not selected as leader, there is no harm in being in
 	// RoundStateEndorserCommittee. Also, we may not be able to directly
 	// connect in larger networks at all. We may need to adjust this to send to
 	// *any* peer so that the gossip can work
-	if len(r.OnlineEndorsers) < int(r.config.Quorum) {
+	if len(r.onlineEndorsers) < int(r.config.Quorum) {
 		// XXX: possibly it should be stricter and require e.config.Endorsers
 		// online
 		return RoundStateInactive, nil
@@ -526,7 +526,8 @@ func (r *EndorsmentProtocol) updateStableSeed(
 	if err != nil {
 		return err
 	}
-	r.drng = randFromSeed(roundSeed)
+	r.selectionRand = randFromSeed(roundSeed)
+
 	r.FailedAttempts = 0 // because we just set the seed
 	r.setRoundForTime(now)
 
@@ -646,7 +647,7 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 	r.activeSample = r.nextActiveSample(r.activeSample)
 	r.logger.Debug(
 		"RRR DRGB SAMPLE   ...........",
-		"r", r.Number, "ns", r.drng.NumSamplesRead(), "s", r.activeSample,
+		"r", r.Number, "ns", r.selectionRand.NumSamplesRead(), "s", r.activeSample,
 		"kn", r.a.NumKnown(), "a", r.a.NumActive(), "df", f-fprevious, "f", f,
 		"th", r.chainHeadRoundStart.Truncate(time.Millisecond).UnixNano(),
 		"bn", r.chainHead.GetNumber(), "br", r.chainHeadRound, "#", Hash(r.chainHead.Hash()).Hex())
@@ -654,12 +655,11 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 	return f
 }
 
-// nextActiveSample returns a random permutation of indices into nActive.
-// The permutation should be ne (n endorsers) elements long. It is sample without
-// replacement.  This is contrary to the paper because replacement causes issues
-// for small networks in the case where endorsers are selected more than once by
-// the same permutation.
-
+// RandomSample fils the slice s with a selection of integers sampled in the
+// range [0, limit) without replacement. Each number in the range has an equal
+// probability of being included. limit must be greater than the length of the
+// slice. This function pancis if it is not
+//
 // TODO: We use the method described in 4 here
 // 	https://cs.stackexchange.com/questions/104930/efficient-n-choose-k-random-sampling
 // See also Knuth V2.3.4.2 Algorithm S, and the improvements on it offered in
@@ -667,8 +667,99 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 // http://www.ittc.ku.edu/~jsv/Papers/Vit84.sampling.pdf.
 // for theoretical background and pseudo code. The methods guarantee that any
 // single element would be selected with P nEndorsers/nActive
-func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 
+func RandSampleRange(source dRNG, limit int, s []int) []int {
+
+	nsamples := len(s)
+
+	// This will force select them all active identities when na <= ns. na=0
+	// is not special.
+	if limit <= nsamples {
+		panic("limit must be greater than the length of the slice - otherwise all elements would be selected")
+	}
+
+	// if nactive isn't at least twice as big as nsamples, invert the process
+	// and evict randomly chosen elements.
+	if limit < nsamples*2 {
+
+		s = make([]int, limit)
+
+		for i := 0; i < limit; i++ {
+			s[i] = i
+		}
+
+		for len(s) > nsamples {
+			rv := source.Intn(len(s))
+
+			// move selected to end then remove then shorten the slice by 1
+			s[rv], s[len(s)-1] = s[len(s)-1], s[rv]
+			s = s[:len(s)-1]
+		}
+		return s
+	}
+
+	indices := map[int]bool{}
+	for i := 0; i < nsamples; i++ {
+		var rv int
+		for {
+			rv = source.Intn(limit)
+			if indices[rv] {
+				continue
+			}
+			break
+		}
+		indices[rv] = true
+		s[i] = rv
+	}
+	return s
+}
+
+func RandSelect(source dRNG, limit, nsamples int) map[int]bool {
+
+	s := map[int]bool{}
+
+	// This will force select them all active identities when na <= ns. na=0
+	// is not special.
+	if limit <= nsamples {
+		panic("limit must be greater than the length of the slice - otherwise all elements would be selected")
+	}
+
+	// if nactive isn't at least twice as big as nsamples, invert the process
+	// and evict randomly chosen elements.
+	if limit < nsamples*2 {
+
+		for i := 0; i < limit; i++ {
+			s[i] = true
+		}
+
+		for len(s) > nsamples {
+			rv := source.Intn(len(s))
+
+			delete(s, rv)
+		}
+		return s
+	}
+
+	for i := 0; i < nsamples; i++ {
+		var rv int
+		for {
+			rv = source.Intn(limit)
+			if s[rv] {
+				continue
+			}
+			break
+		}
+		s[rv] = true
+	}
+	return s
+}
+
+// nextActiveSample returns a random permutation of indices into nActive.
+// The permutation should be ne (n endorsers) elements long. It is sample without
+// replacement.  This is contrary to the paper because replacement causes issues
+// for small networks in the case where endorsers are selected more than once by
+// the same permutation.
+func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 	// divergence (3) we do sample *without* replacement because replacement
 	// predjudices the quorum in small networks (and network initialisation)
 
@@ -689,40 +780,7 @@ func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
 		return s
 	}
 
-	// if nactive isn't at least twice as big as nsamples, invert the process
-	// and evict randomly chosen elements.
-	if nactive < nsamples*2 {
-
-		s = make([]int, nactive)
-
-		for i := 0; i < nactive; i++ {
-			s[i] = i
-		}
-
-		for len(s) > nsamples {
-			rv := r.drng.Intn(len(s))
-
-			// move selected to end then remove then shorten the slice by 1
-			s[rv], s[len(s)-1] = s[len(s)-1], s[rv]
-			s = s[:len(s)-1]
-		}
-		return s
-	}
-
-	indices := map[int]bool{}
-	for i := 0; i < nsamples; i++ {
-		var rv int
-		for {
-			rv = r.drng.Intn(nactive)
-			if indices[rv] {
-				continue
-			}
-			break
-		}
-		indices[rv] = true
-		s[i] = rv
-	}
-	return s
+	return RandSampleRange(r.selectionRand, nactive, s)
 }
 
 // RoundsSince returns the number of rounds since the provided time for the
@@ -757,7 +815,7 @@ func (r *EndorsmentProtocol) electAndPropose(b Broadcaster) {
 		return
 	}
 
-	if len(r.OnlineEndorsers) < int(r.config.Quorum) {
+	if len(r.onlineEndorsers) < int(r.config.Quorum) {
 		r.logger.Debug(
 			"RRR *** insufficient endorsers online ***", "round", r.Number,
 			"addr", r.nodeAddr.Hex(), "err", err)

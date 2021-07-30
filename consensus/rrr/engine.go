@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
-	"time"
 
 	lru "github.com/hashicorp/golang-lru"
 )
@@ -304,15 +303,16 @@ func (e *Engine) run(chain EngineChainReader, ch <-chan interface{}) {
 	}
 }
 
-// HandleMsg handles a message from peer
+// HandleMsg handles a message from peer and deals with gossiping consensus
+// messages where necessary.
 func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 
 	var err error
 
 	msgHash := Keccak256Hash(e.codec.c, msg)
 
-	rmsg := &RMsg{}
-	if err = e.codec.DecodeBytes(msg, rmsg); err != nil {
+	rmsg := RMsg{}
+	if err = e.codec.DecodeBytes(msg, &rmsg); err != nil {
 		return true, err
 	}
 
@@ -320,45 +320,122 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 		"RRR HandleMsg", "#msg", msgHash.Hex(),
 		"#raw", e.codec.Keccak256Hash(rmsg.Raw).Hex())
 
-	// Note: it is the msgHash we want here, not the raw hash. We want it to be
-	// possible for leader candidates to request a re-evaluation of the same
-	// block proposal. Otherwise they can get stuck in small network scenarios.
 	if seen := e.updateInboundMsgTracking(peerAddr, msgHash); seen {
 		e.logger.Trace("RRR HandleMsg - ignoring previously seen")
 		return true, nil
 	}
+
+	// If its a normal direct consensus message, handle and return
+	if rmsg.Round == 0 {
+		return true, e.handleMsg(peerAddr, rmsg)
+	}
+
+	// Ok this is a gossiped consensus message
+
+	if rmsg.Round != e.Number {
+		e.logger.Debug("RRR HandleMsg - ignoring gossip for different round", "r", e.Number, "rmsg.Round", rmsg.Round)
+		return true, nil
+	}
+
+	// For gossiped messages we also need to track the hash of the Raw. Because
+	// we change the To list in the envelop as we proprage the gossip.
+	// Terminating the gossip requires that we ignore messages we have seen
+	// before.
+	rawHash := Keccak256Hash(e.codec.c, rmsg.Raw)
+	if seen := e.updateInboundMsgTracking(peerAddr, rawHash); seen {
+		e.logger.Trace("RRR HandleMsg - ignoring previously seen gossip", "r", e.Number, "#raw", rawHash.Hex())
+		return true, nil
+	}
+
+	// traditional broadcast gossip - the only termination condition is that a node sees the message twice.
+	// var handleErr error
+	// for _, addr := range rmsg.To {
+	// 	if addr == e.nodeAddr {
+	// 		handleErr = e.handleMsg(peerAddr, rmsg)
+	// 		break
+	// 	}
+	// }
+	// err = e.continueEndorserGossip(e, rmsg)
+	// if err != nil {
+	// 	e.logger.Trace("RRR HandleMsg - continueEndorserGossip", "r", e.Number, "err", err)
+	// }
+	// return true, handleErr
+
+	// delivery gossip
+
+	// For each recipient we have a direct peer connection, send it directly. If
+	// any are left continue the gossip. If none are left there is no point
+	// continuing the gossip - we know all recipients have recieved it at least
+	// once if To is empty.
+	var handleErr error
+	var to []Address
+	for _, addr := range rmsg.To {
+
+		// Handle the message if the local node is a recipient
+		if addr == e.nodeAddr {
+			e.logger.Trace("RRR HandleMsg - gossip delivery", "r", e.Number, "to", addr.Hex(), "#raw", rawHash.Hex())
+			handleErr = e.handleMsg(peerAddr, rmsg)
+			continue
+		}
+
+		// Forward directly to any recipient we have a peer connection for.
+		if p, ok := e.onlineEndorsers[addr]; ok {
+			e.peerSend(p, addr, msg, msgHash)
+			continue
+		}
+
+		// collect any remainders
+		to = append(to, addr)
+	}
+
+	// if there are any gossip recipients left, continue the gossip
+	if len(to) > 0 {
+		err = e.continueEndorserGossip(e, rmsg, to)
+		if err != nil {
+			e.logger.Trace("RRR HandleMsg - continueEndorserGossip", "r", e.Number, "err", err)
+		}
+	}
+
+	return true, handleErr
+}
+
+// handleMsg handles a message from peer that is intended for the local node.
+func (e *Engine) handleMsg(peerAddr Address, rmsg RMsg) error {
+
+	var err error
 
 	switch rmsg.Code {
 	case RMsgIntent:
 
 		e.logger.Trace("RRR HandleMsg - RMSgIntent")
 
-		si := &EngSignedIntent{ReceivedAt: time.Now(), Seq: rmsg.Seq}
+		si := &EngSignedIntent{}
 
 		if si.Pub, err = e.codec.DecodeSignedIntent(&si.SignedIntent, rmsg.Raw); err != nil {
 			e.logger.Info("RRR Intent decodeverify failed", "err", err)
-			return true, err
+			return err
 		}
 
 		if !e.PostIfRunning(si) {
 			e.logger.Info("RRR Intent engine not running")
 		}
 
-		return true, nil
+		return nil
 
 	case RMsgConfirm:
 
 		e.logger.Trace("RRR HandleMsg - RMsgConfirm")
-		sc := &EngSignedEndorsement{ReceivedAt: time.Now(), Seq: rmsg.Seq}
+		sc := &EngSignedEndorsement{}
 
-		if sc.Pub, err = e.codec.DecodeSignedEndorsement(&sc.SignedEndorsement, rmsg.Raw); err != nil {
+		if sc.Pub, err = e.codec.DecodeSignedEndorsement(
+			&sc.SignedEndorsement, rmsg.Raw); err != nil {
 
 			e.logger.Debug("RRR RMsgConfirm decodeverify failed", "err", err)
-			return true, err
+			return err
 		}
 
 		e.PostIfRunning(sc)
-		return true, nil
+		return nil
 
 	case RMsgEnrol:
 
@@ -370,14 +447,14 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 		ei := EngEnrolIdentity{}
 		if err = e.codec.DecodeBytes(rmsg.Raw, &ei); err != nil {
 			e.logger.Debug("RRR MsgEnrol decode EngEnrolIdentity failed", "err", err)
-			return true, err
+			return err
 		}
 
 		e.PostIfRunning(&ei)
-		return true, nil
+		return nil
 
 	default:
-		return true, ErrRMsgInvalidCode
+		return ErrRMsgInvalidCode
 	}
 }
 
@@ -389,20 +466,30 @@ func (e *Engine) FindPeers(
 
 // Send the message to the peer - if its hash is not in the ARU cache for the
 // peer
-func (e *Engine) Send(peerAddr Address, msg []byte) error {
-	e.logger.Trace("RRR Send")
-
-	msgHash := e.codec.Keccak256Hash(msg)
+func (e *Engine) Send(peerAddr Address, rmsg RMsg) error {
 
 	peers := e.peerFinder.FindPeers(map[Address]bool{peerAddr: true})
-	if len(peers) != 1 {
-		return fmt.Errorf("RRR Send - no peer connection")
+	if len(peers) != 1 || peers[peerAddr] == nil {
+
+		// Not directly connected, have to gossip
+
+		rmsg.Round = e.Number
+		rmsg.To = []Address{peerAddr}
+		e.logger.Debug("RRR Send - via gossip", "r", e.Number, "to", peerAddr)
+		e.initiateEndorserGossip(e, rmsg)
+		return nil
 	}
-	peer := peers[peerAddr]
-	if peer == nil {
-		return fmt.Errorf("internal error, FindPeers returning unasked for peer")
+
+	e.logger.Trace("RRR Send - direct")
+	msg, err := e.codec.EncodeToBytes(rmsg)
+	if err != nil {
+		e.logger.Info("RRR Send encoding rmsg", "err", err)
+		return err
 	}
-	return e.peerSend(peer, peerAddr, msg, msgHash)
+	msgHash := e.codec.Keccak256Hash(msg)
+
+	// directly connected
+	return e.peerSend(peers[peerAddr], peerAddr, msg, msgHash)
 }
 
 func (e *Engine) peerSend(
@@ -474,19 +561,11 @@ func (e *Engine) SendSignedEndorsement(intenderAddr Address, et *EngSignedIntent
 		return err
 	}
 
-	// Note: by including the senders sequence, and remembering that the sender
-	// will be changing the round also, we can be sure we will reply even if
-	// the intent is otherwise a duplicate.
-	rmsg := &RMsg{Code: RMsgConfirm, Seq: et.Seq}
+	rmsg := RMsg{Code: RMsgConfirm}
 
 	rmsg.Raw, err = e.codec.EncodeSignEndorsement(c, e.privateKey)
 	if err != nil {
 		e.logger.Info("RRR encoding SignedEndorsement", "err", err.Error())
-		return err
-	}
-	msg, err := e.codec.EncodeToBytes(rmsg)
-	if err != nil {
-		e.logger.Info("RRR encoding RMsgConfirm", "err", err.Error())
 		return err
 	}
 
@@ -495,7 +574,7 @@ func (e *Engine) SendSignedEndorsement(intenderAddr Address, et *EngSignedIntent
 		"endorser", e.nodeID.Hex())
 
 	// find the peer candidate
-	return e.Send(intenderAddr, msg)
+	return e.Send(intenderAddr, rmsg)
 }
 
 func (e *Engine) Seal(blockHeader BlockHeader, sealCommitter SealCommitter) error {

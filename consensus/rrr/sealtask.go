@@ -154,10 +154,6 @@ func (r *EndorsmentProtocol) newPendingIntent(
 		return nil, err
 	}
 
-	if pe.Msg, err = r.codec.EncodeToBytes(pe.RMsg); err != nil {
-		return nil, err
-	}
-
 	pe.Endorsements = make([]*SignedEndorsement, 0, r.config.Quorum)
 	pe.Endorsers = make(map[Address]bool)
 

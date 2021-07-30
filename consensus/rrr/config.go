@@ -16,6 +16,7 @@ type Config struct {
 	// MAX(Candidates,MinIdleAttempts) it is made idle. Used to avoid over
 	// agressive idling in small networks.
 	MinIdleAttempts uint64 `toml:"omitempty"`
+	GossipFanout    int    `toml:"omitempty"`
 }
 
 // DefaultConfig provides the default rrr consensus configuration
@@ -26,7 +27,8 @@ var DefaultConfig = &Config{
 	Candidates:        2,
 	Endorsers:         7,
 	Quorum:            4,
-	Activity:          200,
+	Activity:          2000,
 	StablePrefixDepth: 6,
 	MinIdleAttempts:   5,
+	GossipFanout:      4,
 }

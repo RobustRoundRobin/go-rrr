@@ -1,7 +1,10 @@
 package rrr
 
 import (
+	"bytes"
 	"crypto/ecdsa"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -103,7 +106,8 @@ type EndorsmentProtocol struct {
 	vrf ecvrf.VRF
 	T   RoundTime
 
-	drng dRNG
+	selectionRand dRNG
+	gossipRand    dRNG
 	// Updated in the NewChainHead method
 	chainHead            BlockHeader
 	chainHeadExtraHeader *ExtraHeader     // genesis & consensus blocks
@@ -137,7 +141,7 @@ type EndorsmentProtocol struct {
 	// is to send to the node that minted the last block.
 	reEnrolSelf bool
 
-	OnlineEndorsers map[Address]Peer
+	onlineEndorsers map[Address]Peer
 
 	// These get updated each round on all nodes without regard to which are
 	// leaders/endorsers or participants.
@@ -186,6 +190,21 @@ func NewRoundState(
 		roundLength:  time.Duration(config.RoundLength) * time.Millisecond,
 		activeSample: make([]int, config.Endorsers),
 	}
+
+	// We want the gossip rand to be different on all nodes, so we seed it from crypto rand
+	b := make([]byte, 8)
+	_, err := rand.Read(b)
+	if err != nil {
+		panic(fmt.Sprintf("reading crypt/rand for gossip seed: %v", err))
+	}
+
+	// Note we don't bother re-seeding  this after startup.
+	var gossipSeed uint64
+	err = binary.Read(bytes.NewBuffer(b), binary.LittleEndian, &gossipSeed)
+	if err != nil {
+		panic(fmt.Sprintf("converting gossip seed: %v", err))
+	}
+	r.gossipRand = randFromSeed(gossipSeed)
 
 	if logger != nil {
 		logger.Trace(
@@ -433,6 +452,103 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 	return nil
 }
 
+// gossipSampleEndorsers randomly selects a subset of the online endorsers. The
+// size of the selection is configured by config.GossipFanout
+func (r *EndorsmentProtocol) gossipSampleEndorsers() map[Address]Peer {
+	// randomly selected subset of connected endorsers to initiate the gossip with.
+	fanout := map[Address]Peer{}
+
+	if len(r.onlineEndorsers) <= r.config.GossipFanout {
+		// just copy what we have
+		for e := range r.onlineEndorsers {
+			fanout[e] = r.onlineEndorsers[e]
+		}
+		return fanout
+	}
+
+	sample := RandSelect(r.gossipRand, len(r.onlineEndorsers), r.config.GossipFanout)
+
+	pos := 0
+	for e := range r.onlineEndorsers {
+		if sample[pos] {
+			fanout[e] = r.onlineEndorsers[e]
+		}
+		pos++
+	}
+
+	return fanout
+}
+
+// gossipAddressToAbsentEndorsers sets the To addresses on the supplied rmsg to
+// refer to the each endorser we don't have a direct connection with.
+func (r *EndorsmentProtocol) gossipAddressToAbsentEndorsers(rmsg RMsg) RMsg {
+
+	rmsg.Round = r.Number
+	rmsg.To = make([]Address, 0, len(r.endorsers)-len(r.onlineEndorsers))
+
+	// We are addressing the RMsg for each endorser we don't have a direct connection with.
+	for e := range r.endorsers {
+		if _, ok := r.onlineEndorsers[e]; ok {
+			continue
+		}
+		rmsg.To = append(rmsg.To, e)
+	}
+	return rmsg
+}
+
+// initiateEndorserGossip starts the process of gossiping a message originating
+// at the current node and addressed to each endorser we don't have a direct
+// connection with.
+func (r *EndorsmentProtocol) initiateEndorserGossip(b Broadcaster, rmsg RMsg) error {
+
+	var err error
+
+	rmsg = r.gossipAddressToAbsentEndorsers(rmsg)
+
+	var msg []byte
+	if msg, err = r.codec.EncodeToBytes(rmsg); err != nil {
+		return err
+	}
+
+	fanout := r.gossipSampleEndorsers()
+
+	err = b.Broadcast(r.nodeAddr, fanout, msg)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// continueEndorserGossip updates the recipient list and broadcasts the message
+// to a small random selection of the currently connected endorsers.
+func (r *EndorsmentProtocol) continueEndorserGossip(b Broadcaster, rmsg RMsg, to []Address) error {
+
+	var err error
+
+	if len(to) == 0 {
+		return fmt.Errorf("RRR continueEndorserGossip - no gossip recipients left on rmsg")
+	}
+
+	rmsg.PathLength += 1
+	rmsg.To = to
+
+	r.logger.Debug(
+		"RRR continueEndorserGossip", "r", r.Number, "n", len(rmsg.To), "path", rmsg.PathLength)
+
+	var msg []byte
+	if msg, err = r.codec.EncodeToBytes(rmsg); err != nil {
+		return err
+	}
+
+	fanout := r.gossipSampleEndorsers()
+
+	err = b.Broadcast(r.nodeAddr, fanout, msg)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // broadcastCurrentIntent sends the current intent to all known *online* peers
 // selected as endorsers. It does this un-conditionally. It is the callers
 // responsibility to call this from the right consensus engine state - including
@@ -440,22 +556,39 @@ func (r *EndorsmentProtocol) handleIntent(et *EngSignedIntent) error {
 func (r *EndorsmentProtocol) broadcastCurrentIntent(b Broadcaster) {
 
 	r.intentMu.Lock()
+	defer r.intentMu.Unlock()
 	if r.intent == nil {
-		r.intentMu.Unlock()
 		r.logger.Debug("RRR broadcastCurrentIntent - no intent")
 		return
 	}
 
-	msg := r.intent.Msg
-
-	if len(r.OnlineEndorsers) == 0 {
-		r.intentMu.Unlock()
+	if len(r.onlineEndorsers) == 0 {
 		return
 	}
-	err := b.Broadcast(r.nodeAddr, r.OnlineEndorsers, msg)
-	r.intentMu.Unlock()
+
+	var err error
+	var msg []byte
+
+	// First send directly with no gossip to all the endorsers we are directly connected to.
+	if msg, err = r.codec.EncodeToBytes(r.intent.RMsg); err != nil {
+		r.logger.Info("RRR broadcastCurrentIntent - bad message", "err", err)
+		return
+	}
+
+	err = b.Broadcast(r.nodeAddr, r.onlineEndorsers, msg)
 	if err != nil {
 		r.logger.Info("RRR BroadcastCurrentIntent - Broadcast", "err", err)
+	}
+
+	if len(r.onlineEndorsers) == len(r.endorsers) {
+		r.logger.Debug("RRR broadcastCurrentIntent - all endorsers connected (no gossip required)")
+		return
+	}
+
+	r.logger.Debug("RRR broadcastCurrentIntent - via gossip", "r", r.Number)
+	err = r.initiateEndorserGossip(b, r.intent.RMsg)
+	if err != nil {
+		r.logger.Info("RRR BroadcastCurrentIntent - gossip", "err", err)
 	}
 }
 

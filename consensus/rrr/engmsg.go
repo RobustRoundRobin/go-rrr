@@ -1,9 +1,5 @@
 package rrr
 
-import (
-	"time"
-)
-
 // consensus message types
 
 // RMsgCode identifies the rrr message type. rrrMsg identifies rrr's
@@ -37,27 +33,38 @@ const (
 // RMsg is the dev p2p (eth) message for RRR
 type RMsg struct {
 	Code RMsgCode
-	// Seq should be incremented to cause an explicit message resend. It is not
-	// used for any other purpose
-	Seq uint
-	Raw []byte
+	Raw  []byte
+
+	// Gossiping support for partialy connected networks (which is increasingly
+	// common the larger the number of active identities)
+
+	Round uint64
+
+	// If the message is to be gossiped, To are the intended recipients. Any
+	// node that has a direct connection for any To address will simply send
+	// directly, remove it from the To list, and only re-broadcast if any To's
+	// remain. Note that in any given round we are only gossiping RMsgIntent's or
+	// RMsgConfirm's. And we are only gossiping amongst leader candidates and
+	// endorsers selected for the current round - not the entire network.
+	To []Address
+
+	// telemetry only, incremented each time the message is re-gossiped
+	PathLength uint32
 }
 
 // eng* types can be sent at any tome the the engines runningCh.
 type EngSignedIntent struct {
 	SignedIntent
-	Pub        []byte // Derived from signature
-	ReceivedAt time.Time
-	Seq        uint // from RMsg
+	Pub []byte // Derived from signature
 }
 type EngSignedEndorsement struct {
 	SignedEndorsement
-	Pub        []byte // Derived from signature
-	ReceivedAt time.Time
-	Seq        uint // from RMsg
+	Pub []byte // Derived from signature
 }
 
 type EngEnrolIdentity struct {
-	NodeID  [32]byte
+	NodeID [32]byte
+
+	Round   uint64
 	ReEnrol bool
 }
