@@ -251,7 +251,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(beta, pi []byte, chain sealChainRe
 		// automaticaly on startup. We don't want the noise of redundant
 		// enrolments in the block headers so we just filter them out.
 
-		if r.a.IsActive(eb.NodeID.Address()) {
+		if !r.a.IsIdle(r.Number, eb.NodeID.Address()) {
 			r.logger.Info(
 				"RRR sealCurrentBlock - ignoring redundant enrolment",
 				"node", eb.NodeID.Hex(), "addr", eb.NodeID.Address().Hex())

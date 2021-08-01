@@ -284,26 +284,23 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 
 // autoEnrolSelf should be called imediately after determing the candidates and
 // endorsers for the *new* round (at the begining of the intent phase)
+//
+// Leaders should automatically re-enrol if they are idle. It is sent to all the
+// freshly selected leaders to give the shortest possible latency on the
+// re-enrolment and to ensure we send the enrolment to nodes we know to be live.
 func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 
-	if !r.reEnrolSelf {
+	if !r.a.IsIdle(r.Number, r.nodeAddr) {
+		r.logger.Info("RRR autoEnrolSelf - self is active")
 		return
-	}
-
-	var reEnrolers []Address
-
-	if r.chainHeadExtra != nil {
-		reEnrolers = append(reEnrolers, r.chainHeadExtra.Intent.NodeID.Address())
 	}
 
 	// Enrolments are included by the leader. The fastest re-enrol is achived
 	// by sending our request to all of the leaders for the next round.
-	if qhead := r.candidateQueueHead(r.nodeID.Address()); len(qhead) > 0 {
-		reEnrolers = qhead
-	}
+	cands := r.a.NOldest(r.Number, int(r.config.Candidates*2))
 
-	if len(reEnrolers) == 0 {
-		r.logger.Info("RRR PhaseTick - no reEnrolers found for idle node")
+	if len(cands) == 0 {
+		r.logger.Info("RRR PhaseTick - no candidates found to re-enrol self")
 		return
 	}
 
@@ -318,8 +315,11 @@ func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 	}
 
 	m := map[Address]bool{}
-	for _, addr := range reEnrolers {
-		m[addr] = true
+	for _, id := range cands {
+		if id == r.nodeID {
+			continue
+		}
+		m[id.Address()] = true
 	}
 	peers := b.FindPeers(m)
 
@@ -329,7 +329,6 @@ func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 		return
 	}
 	r.logger.Info("RRR PhaseTick - Broadcast RMsgEnrol", "self", r.nodeAddr.Hex())
-	r.reEnrolSelf = false
 }
 
 // setChainHead updates the chain head state variables *including* the Rand
@@ -384,61 +383,17 @@ func (r *EndorsmentProtocol) setChainHead(chain EngineChainReader, head BlockHea
 	return nil
 }
 
-// reEnrolIdleLeaders will queue enrolments for all the leaders that became idle
-// in the last call to AccumulateActive. Use this if the number of active
-// identities has fallen to low to avoid the network loosing its minimum quorum
-// for consensus.
-func (r *EndorsmentProtocol) idleLeaderQuorumMitigation() {
-
-	// If this node is not in the active set, automatically issue a re-enrol.
-	// Leader candidates are culled as idle if they are oldest for Nc rounds.
-	// That is quite an agressive standard. Operators could do this but it would
-	// effectively require them all to open up the rpc ports in order to
-	// guarantee a stable network. Note that we *always* do this. THis is the
-	// idled node declaring itself active by imediately re-enroling.
-
-	// first reset it, if we are now  active no need to keep trying to enrol.
-	r.reEnrolSelf = false
-	if !r.a.IsActive(r.nodeAddr) {
-		r.logger.Info(
-			"RRR accumualteActive - self not in active, initiate re-enrol", "self", r.nodeAddr.Hex())
-		r.reEnrolSelf = true
-	}
-
-	// Now consider re-enroling identities un conditionaly. We only do this when
-	// the number of active identities is low enough to risk the consensus
-	// quorum.
-	if r.a.NumActive() > (int(r.config.Candidates) + int(r.config.Endorsers)) {
-		return
-	}
-
-	idledLeaders := r.a.IdleLeaders()
-	if len(idledLeaders) == 0 {
-		r.logger.Info(
-			"RRR idleLeaderQuorumMitigation - warning: low number of active identities", "r", r.Number)
-	}
-
-	r.logger.Info(
-		"RRR accumulateActive - na < nc+ en. auto re-enroling idle leaders.",
-		"r", r.Number, "na", r.a.NumActive(), "num-renrol", len(idledLeaders))
-
-	for _, nodeId := range idledLeaders {
-		r.QueueEnrolment(&EngEnrolIdentity{NodeID: nodeId, ReEnrol: true})
-	}
-}
-
 func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head BlockHeader) error {
+
+	var err error
 
 	// Establish the order of identities in the round robin selection. Age is
 	// determined based on the identity enrolments in the block, and of the
 	// identities which enroled blocks - both of which are entirely independent
 	// of the number of attempts required to produce a block in any given
 	// round.
-	err := r.a.AccumulateActive(
-		r.genesisEx.ChainID, chain, head, r.Number)
-
-	if err == nil {
-		r.idleLeaderQuorumMitigation()
+	if err = r.a.AccumulateActive(
+		r.Number, r.genesisEx.ChainID, chain, head); err == nil {
 		return nil
 	}
 	if !errors.Is(err, ErrBranchDetected) {
@@ -451,8 +406,7 @@ func (r *EndorsmentProtocol) accumulateActive(chain EngineChainReader, head Bloc
 	r.a.Reset(head)
 
 	if err := r.a.AccumulateActive(
-		r.genesisEx.ChainID, chain, head, r.Number); err == nil {
-		r.idleLeaderQuorumMitigation()
+		r.Number, r.genesisEx.ChainID, chain, head); err == nil {
 		return nil
 	}
 
@@ -485,8 +439,9 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 	sort.Ints(r.activeSample)
 
 	// If we are a leader candidate we need to broadcast an intent.
-	r.candidates, r.endorsers, r.selection, err = r.a.SelectCandidatesAndEndorsers(
-		r.activeSample, r.Number)
+	r.candidates, r.endorsers, err = r.a.SelectCandidatesAndEndorsers(
+		r.Number, r.activeSample,
+	)
 	if err != nil {
 		return RoundStateInactive, err
 	}
@@ -636,7 +591,7 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 
 	var i uint32
 	for i = fprevious; i < f-1; i++ {
-		r.activeSample = r.nextActiveSample(r.activeSample)
+		r.activeSample = r.a.NextActiveSample(rh+uint64(i+1), r.selectionRand, r.activeSample)
 		r.logger.Debug(
 			"RRR DRGB CATCHUP  ...........",
 			"r", r.Number, "s", r.activeSample,
@@ -644,143 +599,15 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 	}
 
 	// Always do one
-	r.activeSample = r.nextActiveSample(r.activeSample)
+	r.activeSample = r.a.NextActiveSample(rh+uint64(f), r.selectionRand, r.activeSample)
 	r.logger.Debug(
 		"RRR DRGB SAMPLE   ...........",
 		"r", r.Number, "ns", r.selectionRand.NumSamplesRead(), "s", r.activeSample,
-		"kn", r.a.NumKnown(), "a", r.a.NumActive(), "df", f-fprevious, "f", f,
+		"a", r.a.NumActive(), "df", f-fprevious, "f", f,
 		"th", r.chainHeadRoundStart.Truncate(time.Millisecond).UnixNano(),
 		"bn", r.chainHead.GetNumber(), "br", r.chainHeadRound, "#", Hash(r.chainHead.Hash()).Hex())
 
 	return f
-}
-
-// RandomSample fils the slice s with a selection of integers sampled in the
-// range [0, limit) without replacement. Each number in the range has an equal
-// probability of being included. limit must be greater than the length of the
-// slice. This function pancis if it is not
-//
-// TODO: We use the method described in 4 here
-// 	https://cs.stackexchange.com/questions/104930/efficient-n-choose-k-random-sampling
-// See also Knuth V2.3.4.2 Algorithm S, and the improvements on it offered in
-// the answer to ex 8 and here
-// http://www.ittc.ku.edu/~jsv/Papers/Vit84.sampling.pdf.
-// for theoretical background and pseudo code. The methods guarantee that any
-// single element would be selected with P nEndorsers/nActive
-
-func RandSampleRange(source dRNG, limit int, s []int) []int {
-
-	nsamples := len(s)
-
-	// This will force select them all active identities when na <= ns. na=0
-	// is not special.
-	if limit <= nsamples {
-		panic("limit must be greater than the length of the slice - otherwise all elements would be selected")
-	}
-
-	// if nactive isn't at least twice as big as nsamples, invert the process
-	// and evict randomly chosen elements.
-	if limit < nsamples*2 {
-
-		s = make([]int, limit)
-
-		for i := 0; i < limit; i++ {
-			s[i] = i
-		}
-
-		for len(s) > nsamples {
-			rv := source.Intn(len(s))
-
-			// move selected to end then remove then shorten the slice by 1
-			s[rv], s[len(s)-1] = s[len(s)-1], s[rv]
-			s = s[:len(s)-1]
-		}
-		return s
-	}
-
-	indices := map[int]bool{}
-	for i := 0; i < nsamples; i++ {
-		var rv int
-		for {
-			rv = source.Intn(limit)
-			if indices[rv] {
-				continue
-			}
-			break
-		}
-		indices[rv] = true
-		s[i] = rv
-	}
-	return s
-}
-
-func RandSelect(source dRNG, limit, nsamples int) map[int]bool {
-
-	s := map[int]bool{}
-
-	// This will force select them all active identities when na <= ns. na=0
-	// is not special.
-	if limit <= nsamples {
-		panic("limit must be greater than the length of the slice - otherwise all elements would be selected")
-	}
-
-	// if nactive isn't at least twice as big as nsamples, invert the process
-	// and evict randomly chosen elements.
-	if limit < nsamples*2 {
-
-		for i := 0; i < limit; i++ {
-			s[i] = true
-		}
-
-		for len(s) > nsamples {
-			rv := source.Intn(len(s))
-
-			delete(s, rv)
-		}
-		return s
-	}
-
-	for i := 0; i < nsamples; i++ {
-		var rv int
-		for {
-			rv = source.Intn(limit)
-			if s[rv] {
-				continue
-			}
-			break
-		}
-		s[rv] = true
-	}
-	return s
-}
-
-// nextActiveSample returns a random permutation of indices into nActive.
-// The permutation should be ne (n endorsers) elements long. It is sample without
-// replacement.  This is contrary to the paper because replacement causes issues
-// for small networks in the case where endorsers are selected more than once by
-// the same permutation.
-func (r *EndorsmentProtocol) nextActiveSample(s []int) []int {
-	// divergence (3) we do sample *without* replacement because replacement
-	// predjudices the quorum in small networks (and network initialisation)
-
-	nsamples := len(s)
-
-	// NumKnown includes idle leaders if they have not fallen below the activity
-	// horizon. As we skip the candidates from the endorser selection we must
-	// account for that here.
-	nactive := r.a.NumKnown() - int(r.config.Candidates)
-
-	// This will force select them all active identities when na <= ns. na=0
-	// is not special.
-	if nactive <= nsamples {
-		r.logger.Trace("RRR nextActiveSample - returning identity sample, to few active", "a", r.a.NumActive(), "kn", r.a.NumKnown(), "ns", nsamples)
-		for i := 0; i < nsamples; i++ {
-			s[i] = i
-		}
-		return s
-	}
-
-	return RandSampleRange(r.selectionRand, nactive, s)
 }
 
 // RoundsSince returns the number of rounds since the provided time for the
@@ -896,18 +723,4 @@ func (r *EndorsmentProtocol) readSeal(header BlockHeader) (*SignedExtraData, err
 	}
 
 	return se, nil
-}
-
-// candidateQueueHead returns the Nc * 3 oldest active identities
-func (r *EndorsmentProtocol) candidateQueueHead(exclude Address) []Address {
-
-	var queueHead []Address
-	for _, id := range r.a.NOldestActive(int(r.config.Candidates) * 3) {
-		addr := id.Address()
-		if addr == exclude {
-			continue
-		}
-		queueHead = append(queueHead, addr)
-	}
-	return queueHead
 }

@@ -132,15 +132,6 @@ type EndorsmentProtocol struct {
 	Number         uint64
 	FailedAttempts uint32
 
-	// Leaders need to automatically re-enrol if they are idle. At the end of
-	// the Confirm phase, if a leader candidate receives no endorsements at
-	// all, it will set this flag. The re-enrol message is then sent from the
-	// end of the broadcast phase. It is sent to all the freshly selected
-	// leaders to give the shortest possible latency on the re-enrolment and to
-	// ensure we send the enrolment to nodes we know to be live. The fallback
-	// is to send to the node that minted the last block.
-	reEnrolSelf bool
-
 	onlineEndorsers map[Address]Peer
 
 	// These get updated each round on all nodes without regard to which are
