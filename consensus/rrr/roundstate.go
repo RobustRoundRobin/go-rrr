@@ -136,7 +136,6 @@ type EndorsmentProtocol struct {
 
 	// These get updated each round on all nodes without regard to which are
 	// leaders/endorsers or participants.
-	selection  []Address
 	endorsers  map[Address]bool
 	candidates map[Address]bool
 

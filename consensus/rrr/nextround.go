@@ -290,7 +290,7 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 // re-enrolment and to ensure we send the enrolment to nodes we know to be live.
 func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 
-	if !r.a.IsIdle(r.Number, r.nodeAddr) {
+	if r.a.IsActive(r.nodeAddr) && !r.a.IsIdle(r.Number, r.nodeAddr) {
 		r.logger.Info("RRR autoEnrolSelf - self is active")
 		return
 	}

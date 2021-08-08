@@ -32,16 +32,8 @@ type ActiveSelection interface {
 		roundNumber uint64, chainID Hash, chain blockHeaderReader, head BlockHeader,
 	) error
 
-	// IdleLeaders are the NodeID's of the leaders made idle in the last call
-	// to ActiveSelection due to the idle leader rule. When the number of
-	// active identities is below Nc +Ne these identities should be
-	// automatically re-enroled by the next leader. This is to prevent the
-	// network falling below the quorum, at which point it would halt. Note
-	// that this is reset each time AccumulateActive is called.
-	IdleLeaders(roundNumber uint64) []Hash
-	NOldest(roundNumber uint64, n int) []Hash
-
 	IsIdle(roundNumber uint64, id Address) bool
+	NOldest(roundNumber uint64, n int) []Hash
 
 	NextActiveSample(roundNumber uint64, source dRNG, s []int) []int
 
@@ -171,8 +163,6 @@ type activeList struct {
 	lastOldest Address
 	// becameOldest is the round that lastOldest was set by AccumulateActive
 	becameOldest uint64
-	// accumulatedRound is the round for the most recent call to AccumulateActive
-	accumulatedRound uint64
 
 	selfNodeID Hash // for logging only
 	logger     Logger
@@ -202,7 +192,7 @@ func (a *activeList) MinViableSelection() int {
 	return int(a.config.Candidates + a.config.Endorsers)
 }
 
-// MaxIdleCount returns the number of identities in the active selection that
+// MaxIdle returns the number of identities in the active selection that
 // can go idle without rendering the network inoperable. Strictly this should
 // be  max(0, len(active) - (Nc + Q)). But that doesn't allow for any endorsers
 // to be offline so we make it max(0, len(active) - (Nc + Ne)).
@@ -220,21 +210,23 @@ func (a *activeList) IdleLeaders(roundNumber uint64) []Hash {
 
 	var idles []Hash
 
-	_, _ = a.firstActiveCandidate(roundNumber, func(becameOldest uint64, pos int, act *idActivity) bool {
-		idles = append(idles, act.nodeID)
+	_, _ = a.firstActiveElement(roundNumber, func(becameOldest uint64, pos int, el *list.Element) bool {
+		idles = append(idles, el.Value.(*idActivity).nodeID)
 		return true
 	})
 
 	return idles
 }
 
+// NumIdle returns the number of identities idled due to failed round since the
+// last successful.
 func (a *activeList) NumIdle(roundNumber uint64) int {
 	return len(a.IdleLeaders(roundNumber))
 }
 
-type IdleCallback func(becameOldest uint64, pos int, act *idActivity) bool
+type idleCallback func(becameOldest uint64, pos int, el *list.Element) bool
 
-func (a *activeList) firstActiveCandidate(roundNumber uint64, callbacks ...IdleCallback) (int, *list.Element) {
+func (a *activeList) firstActiveElement(roundNumber uint64, callbacks ...idleCallback) (int, *list.Element) {
 
 	maxIdle := a.MaxIdle()
 
@@ -245,14 +237,16 @@ func (a *activeList) firstActiveCandidate(roundNumber uint64, callbacks ...IdleC
 	// selection - which will change for each accumulate as long as the chain is
 	// progressing. The becameOldest for active[0] only changes if that identity
 	// mints a block or is re-enroled.
-	becameOldest := a.becameOldest
 	youngest := a.activeSelection.Front().Value.(*idActivity)
+	becameOldest := a.becameOldest
+	// becameOldest := youngest.ageRound
 
 	var icur int
-	var cur *list.Element
+	var cur, next *list.Element
 
-	for icur, cur = 0, a.activeSelection.Back(); cur != nil && icur < maxIdle; cur, icur = cur.Prev(), icur+1 {
+	for icur, cur = 0, a.activeSelection.Back(); cur != nil && icur < maxIdle; cur, icur = next, icur+1 {
 
+		next = cur.Prev()
 		// This means there have not been sufficient failed rounds since the
 		// last block seen by accumulate active to make the icur identity idle.
 		// And as we are visiting oldest -> youngest the same holds for all
@@ -265,18 +259,19 @@ func (a *activeList) firstActiveCandidate(roundNumber uint64, callbacks ...IdleC
 
 		// Same reasoning as above
 		if oldestFor < int(a.idleRoundLimit) {
-			// Note that this catches the case where f is < 0
+			// Note that this catches the case where oldestFor comes out < 0
 			return icur, cur
 		}
 
 		for _, cb := range callbacks {
 
-			if !cb(becameOldest, icur, cur.Value.(*idActivity)) {
+			if !cb(becameOldest, icur, cur) {
 				return icur, cur
 			}
 		}
 
-		becameOldest = youngest.ageRound + uint64(icur) + 1
+		// becameOldest = youngest.ageRound + uint64(icur) + 1
+		becameOldest = youngest.ageRound + uint64(icur)
 	}
 	return icur, cur
 }
@@ -286,8 +281,8 @@ func (a *activeList) IsIdle(roundNumber uint64, id Address) bool {
 
 	var found = false
 
-	_, _ = a.firstActiveCandidate(roundNumber, func(becameOldest uint64, pos int, act *idActivity) bool {
-		if act.nodeID.Address() != id {
+	_, _ = a.firstActiveElement(roundNumber, func(becameOldest uint64, pos int, el *list.Element) bool {
+		if el.Value.(*idActivity).nodeID.Address() != id {
 			return true
 		}
 		found = true
@@ -301,7 +296,7 @@ func (a *activeList) NOldest(roundNumber uint64, n int) []Hash {
 	var cands []Hash
 
 	// Skip past the idle
-	for _, cur := a.firstActiveCandidate(
+	for _, cur := a.firstActiveElement(
 		roundNumber); cur != nil && len(cands) < n; cur = cur.Prev() {
 		cands = append(cands, cur.Value.(*idActivity).nodeID)
 	}
@@ -383,6 +378,34 @@ func (a *activeList) AccumulateActive(
 	headHash := Hash(head.Hash())
 	if headHash == a.lastBlockSeen {
 		return nil
+	}
+
+	if a.activeSelection.Len() > 0 {
+
+		// Remove leaders idled due to the oldest-for rule since the last accumulate
+		_, _ = a.firstActiveElement(roundNumber, func(becameOldest uint64, pos int, el *list.Element) bool {
+
+			a.activeSelection.Remove(el)
+
+			act := el.Value.(*idActivity)
+			delete(a.aged, act.nodeID.Address())
+			a.logger.Debug(
+				"RRR AccumulateActive - culled idle leader",
+				"cand", fmt.Sprintf("%s:%05d.%02d", act.nodeID.Address().Hex(), act.ageRound, act.genesisOrder),
+				"r", roundNumber, "ic", pos, "of", roundNumber-becameOldest, "ar", act.ageRound,
+			)
+
+			if a.activeSelection.Len() <= a.MinViableSelection() {
+				// Note: We could restore this guarantee if we re-introduced the failed
+				// attempts mechanism from the "block clock" implementation. I may still
+				// do that as a configuration item.
+				a.logger.Warn(
+					"RRR AccumulateActive - liveness not guaranteed until more candidates are online",
+					"r", roundNumber, "nidle", pos+1, "a", a.activeSelection.Len())
+			}
+
+			return true
+		})
 	}
 
 	blockActivity := BlockActivity{}
@@ -498,6 +521,9 @@ func (a *activeList) AccumulateActive(
 		}
 	}
 
+	a.lastBlockSeen = headHash
+	a.activeBlockFence = headNumber
+
 	// deal with idles
 	activeHorizon := uint64(0)
 	if headNumber > a.config.Activity {
@@ -529,12 +555,8 @@ func (a *activeList) AccumulateActive(
 		delete(a.aged, age.nodeID.Address())
 	}
 
-	a.lastBlockSeen = headHash
-	a.activeBlockFence = headNumber
-
 	oldest := a.activeSelection.Back().Value.(*idActivity)
 	youngest := a.activeSelection.Front().Value.(*idActivity)
-	a.accumulatedRound = youngest.ageRound
 	if a.lastOldest != oldest.nodeID.Address() {
 		a.becameOldest = youngest.ageRound // yes, we mean youngest - its the most recent round
 		a.lastOldest = oldest.nodeID.Address()
@@ -544,7 +566,7 @@ func (a *activeList) AccumulateActive(
 			"id", oldest.nodeID.Address().Hex())
 	}
 
-	a.logSelectionOrder(head, &headActivity, roundNumber)
+	// a.logSelectionOrder(head, &headActivity, roundNumber)
 
 	return nil
 }
@@ -624,8 +646,9 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 
 	selection := make([]Address, 0, Ne+Nc)
 
-	icur, cur := a.firstActiveCandidate(roundNumber, func(becameOldest uint64, pos int, act *idActivity) bool {
-		a.logger.Debug(
+	icur, cur := a.firstActiveElement(roundNumber, func(becameOldest uint64, pos int, el *list.Element) bool {
+		act := el.Value.(*idActivity)
+		a.logger.Info(
 			"RRR selectCandEs - skipped idle leader",
 			"cand", fmt.Sprintf("%s:%05d.%02d", act.nodeID.Address().Hex(), act.ageRound, act.genesisOrder),
 			"r", roundNumber, "ic", pos, "of", roundNumber-becameOldest, "ar", act.ageRound,
@@ -647,7 +670,7 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 	var next *list.Element
 
 	// Take the first nc that pass the "oldest for" rule
-	for ; cur != nil && len(candidates) < Nc; cur = cur.Prev() {
+	for ; cur != nil && len(candidates) < Nc; icur, cur = icur+1, cur.Prev() {
 
 		age := cur.Value.(*idActivity)
 
@@ -657,13 +680,11 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 		candidates[Address(addr)] = true
 
 		a.logger.Debug(
-			"RRR selectCandEs - select candidate",
+			"RRR selectCandEs - C",
 			"cand", fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.genesisOrder),
-			"ic", icur, "a", age.lastActiveBlock(),
-			"r", roundNumber, "ar", age.ageRound)
+			"r", roundNumber, "a", age.lastActiveBlock(), "ar", age.ageRound,
+			"ic", icur)
 		// Note: divergence (1) leader candidates can not be endorsers
-
-		icur++
 	}
 
 	// The permutation is limited to active endorser positions. The leader
@@ -685,12 +706,13 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 
 		pos := permutation[iperm]
 
-		a.logger.Trace(
-			"RRR selectCandEs - select endorser",
-			"r", roundNumber, "pos", pos, "icur", icur, "icur-off", icur-len(candidates),
-		)
-
 		if pos != icur-len(candidates)-nIdle {
+			a.logger.Trace(
+				"RRR selectCandEs - a", "actv",
+				fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.order),
+				"r", roundNumber, "a", age.lastActiveBlock(), "ar", age.ageRound,
+				"ia", icur, "pos", pos,
+			)
 			continue
 		}
 
@@ -699,10 +721,10 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 		// XXX: age < Te (created less than Te rounds) grinding attack mitigation
 
 		a.logger.Debug(
-			"RRR selectCandEs - select", "endo",
+			"RRR selectCandEs - E", "endo",
 			fmt.Sprintf("%s:%05d.%02d", addr.Hex(), age.ageBlock, age.order),
-			"ie", icur, "a", age.lastActiveBlock(),
-			"r", roundNumber, "ar", age.ageRound,
+			"r", roundNumber, "a", age.lastActiveBlock(), "ar", age.ageRound,
+			"ie", icur, "pos", pos,
 		)
 
 		endorsers[Address(addr)] = true
@@ -836,8 +858,8 @@ func (a ByAge) Less(i, j int) bool {
 
 func (a ByAge) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
-// logSelectionOrder is an expensive diagnostic. TODO: wrap this in a lazy logger or query the log level explicitly
-func (a *activeList) logSelectionOrder(head BlockHeader, headActivity *BlockActivity, roundNumber uint64) {
+// LogSelectionOrder is an expensive diagnostic. TODO: wrap this in a lazy logger or query the log level explicitly
+func (a *activeList) LogSelectionOrder(head BlockHeader, headActivity *BlockActivity, roundNumber uint64) {
 
 	a.logger.Debug(
 		"RRR AccumulateActive - logSelectionOrder",
@@ -849,8 +871,9 @@ func (a *activeList) logSelectionOrder(head BlockHeader, headActivity *BlockActi
 	active := make([]selectionItem, a.activeSelection.Len())
 	logs := make([]string, a.activeSelection.Len())
 
-	icur, cur := a.firstActiveCandidate(roundNumber, func(becameOldest uint64, pos int, act *idActivity) bool {
+	icur, cur := a.firstActiveElement(roundNumber, func(becameOldest uint64, pos int, el *list.Element) bool {
 
+		act := el.Value.(*idActivity)
 		active[pos].act = act
 		active[pos].pos = pos
 
@@ -861,12 +884,10 @@ func (a *activeList) logSelectionOrder(head BlockHeader, headActivity *BlockActi
 			"id", act.nodeID.Address().Hex(),
 			"ia", pos,
 			"of", roundNumber-becameOldest,
-			"idle", true,
 		)
 		return true
 	})
 
-	var idle bool
 	for ; cur != nil; icur, cur = icur+1, cur.Prev() {
 
 		active[icur].act = cur.Value.(*idActivity)
@@ -880,7 +901,6 @@ func (a *activeList) logSelectionOrder(head BlockHeader, headActivity *BlockActi
 			"ar", active[icur].act.ageRound,
 			"id", active[icur].act.nodeID.Address().Hex(),
 			"ia", icur,
-			"idle", idle,
 		)
 
 	}
@@ -950,7 +970,7 @@ func (a *activeList) logSelection(
 	candidates map[Address]bool, endorsers map[Address]bool,
 	selection []Address, nCandidates, nEndorsers int) {
 
-	a.logger.Debug("RRR selectCandEs selected", "", a.logger.LazyValue(
+	a.logger.Debug("RRR selectCandEs", "selected", a.logger.LazyValue(
 		func() string {
 			// Dump a report of the selection. By reporting as "block.order", we
 			// can, for small development networks, easily correlate with the
