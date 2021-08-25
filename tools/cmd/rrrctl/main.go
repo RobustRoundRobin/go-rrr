@@ -372,6 +372,7 @@ func genextra(ctx *cli.Context) error {
 	}
 
 	signerNodeID := rrr.NodeIDFromPub(cipherSuite, &key.PublicKey)
+	// fmt.Printf("signerID: %s\n", signerNodeID.Hex())
 
 	args := ctx.Args()
 
@@ -392,6 +393,7 @@ func genextra(ctx *cli.Context) error {
 			return fmt.Errorf("file `%s':%w", filepath, err)
 		}
 		alpha[rrr.Hash(nodeID)] = contrib
+		// fmt.Printf("nodeID: %s\n", nodeID.Hex())
 	}
 
 	extra := &rrr.GenesisExtraData{}

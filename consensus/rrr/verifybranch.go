@@ -42,9 +42,11 @@ func (r *EndorsmentProtocol) checkGenesisExtra(gex *GenesisExtraData) error {
 			"id0",
 			"id", gex.Enrol[0].ID.Hex(), "u", gex.Enrol[0].U.Hex(),
 			"q", hex.EncodeToString(gex.Enrol[0].Q[:]),
+			"selfID", r.nodeID.Hex(),
 			"ok", ok, "err", err)
 		return fmt.Errorf("genesis identity invalid signature: %w", errGensisIdentitiesInvalid)
 	}
+	r.logger.Trace("id0", "id", gex.Enrol[0].ID.Hex(), "selfID", r.nodeID.Hex())
 
 	// Check the genesis seed and the signatures of all the contributions to the genesis seed alpha.
 	hasher := sha3.NewLegacyKeccak256()
