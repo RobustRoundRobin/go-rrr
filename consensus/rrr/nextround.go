@@ -181,7 +181,10 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 					role = "none"
 				}
 
-				r.logger.Info("RRR PhaseTick - ROUND FAILED  xxxxxxxx", "r", r.Number, "f", r.FailedAttempts, "ro", role)
+				r.logger.Info(
+					"RRR PhaseTick - ROUND FAILED  xxxxxxxx",
+					"r", r.Number, "f", r.FailedAttempts,
+					"advanced", roundAdvanced, "newhead", roundBlockArrived, "ro", role)
 			}
 			r.logger.Info("RRR PhaseTick - END OF ROUND ---------", "r", r.Number)
 		} else {

@@ -29,8 +29,10 @@ var (
 	difficultyForEndorser  = big.NewInt(1)
 
 	// message de-duplication
-	lruPeers    = 100 + 6*2
-	lruMessages = 1024
+	lruPeers           = 100 + 6*2
+	lruMessages        = 1024
+	lruHeaderSigner    = 20
+	lruVerifiedHeaders = 20
 )
 
 // EngNewChainHead notifies the run loop of a NewChainHead event.
@@ -89,6 +91,9 @@ type Engine struct {
 	// Track which messages we have posted on our local processing queue. We do
 	// not re-broadcast these. We do not re post these locally.
 	selfMessages *lru.ARCCache
+
+	headerSignerCache   *lru.ARCCache
+	verifiedHeaderCache *lru.ARCCache
 
 	runningMu sync.RWMutex // hold read lock if checking 'runningCh is nil'
 	runningWG sync.WaitGroup
@@ -168,11 +173,22 @@ func NewEngine(
 		return nil, err
 	}
 
+	headerSignerCache, err := lru.NewARC(lruHeaderSigner)
+	if err != nil {
+		return nil, err
+	}
+	verifiedHeaderCache, err := lru.NewARC(lruVerifiedHeaders)
+	if err != nil {
+		return nil, err
+	}
+
 	e := &Engine{
-		privateKey:         privateKey,
-		EndorsmentProtocol: NewRoundState(codec, privateKey, config, logger),
-		peerMessages:       peerMessages,
-		selfMessages:       selfMessages,
+		privateKey:          privateKey,
+		EndorsmentProtocol:  NewRoundState(codec, privateKey, config, logger),
+		peerMessages:        peerMessages,
+		selfMessages:        selfMessages,
+		headerSignerCache:   headerSignerCache,
+		verifiedHeaderCache: verifiedHeaderCache,
 	}
 
 	for _, o := range opts {
@@ -668,6 +684,29 @@ func (e *Engine) VerifyBranchHeaders(
 // engine is based on signatures.
 func (e *Engine) Author(header BlockHeader) (Address, error) {
 
+	return e.headerSigner(header)
+}
+
+func (e *Engine) verifyHeader(chain headerByHashChainReader, header BlockHeader) error {
+
+	h := header.Hash()
+
+	if v, ok := e.verifiedHeaderCache.Get(h); ok {
+		return v.(error)
+	}
+	_, err := e.EndorsmentProtocol.VerifyHeader(chain, header)
+
+	e.verifiedHeaderCache.Add(h, err)
+	return err
+}
+
+func (e *Engine) headerSigner(header BlockHeader) (Address, error) {
+
+	h := header.Hash()
+	if addr, ok := e.headerSignerCache.Get(h); ok {
+		return addr.(Address), nil
+	}
+
 	_, sealerID, _, err := e.codec.DecodeHeaderSeal(header)
 	if err != nil {
 		return Address{}, err
@@ -675,10 +714,8 @@ func (e *Engine) Author(header BlockHeader) (Address, error) {
 
 	sealingNodeAddr := sealerID.Address()
 
-	if sealingNodeAddr == e.nodeAddr {
-		e.logger.Debug("RRR Author - sealed by self", "addr", sealingNodeAddr.Hex(), "bn", header.GetNumber())
-	} else {
-		e.logger.Debug("RRR Author sealed by", "addr", sealingNodeAddr.Hex(), "bn", header.GetNumber())
-	}
+	e.headerSignerCache.Add(h, sealingNodeAddr)
+
 	return sealingNodeAddr, nil
+
 }
