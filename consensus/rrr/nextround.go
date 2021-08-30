@@ -117,7 +117,7 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 		if r.signedIntent != nil {
 
 			oldestSeen := r.signedIntent.NodeID.Address()
-			r.logger.Info(
+			r.logger.Debug(
 				"RRR sending endorsement to oldest seen", "r", r.Number, "oldest", oldestSeen.Hex(), "seen", r.intentsSeen)
 			if err := b.SendSignedEndorsement(oldestSeen, r.signedIntent); err != nil {
 				r.logger.Info(
@@ -688,7 +688,7 @@ func (r *EndorsmentProtocol) electAndPropose(b Broadcaster) {
 				r.NewSignedIntent(et)
 			}
 			if nbuffered != 0 {
-				r.logger.Info("RRR electAndPropose - consumed buffered intents",
+				r.logger.Debug("RRR electAndPropose - consumed buffered intents",
 					"r", r.Number, "count", nbuffered, "self", r.nodeAddr.Hex())
 			}
 		}

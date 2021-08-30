@@ -244,6 +244,39 @@ func (r *EndorsmentProtocol) CalcDifficulty(nodeAddr Address) *big.Int {
 	return difficultyForEndorser
 }
 
+// GetBlockTime returns the time the block was sealed. It decodes the extra data
+// to do this. Consider caching the result.
+func (r *EndorsmentProtocol) GetSealTime(header BlockHeader) (time.Time, error) {
+
+	sealTime := time.Time{}
+	extraData := header.GetExtra()
+
+	if header.GetNumber().Uint64() == 0 {
+
+		extra := GenesisExtraData{}
+
+		err := r.codec.DecodeGenesisExtra(extraData, &extra)
+		if err != nil {
+			return time.Time{}, err
+		}
+
+		if err := sealTime.UnmarshalBinary(extra.ChainInit.SealTime); err != nil {
+			return time.Time{}, err
+		}
+		return sealTime, nil
+	}
+
+	se, _, _, err := r.codec.DecodeHeaderSeal(header)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if err := sealTime.UnmarshalBinary(se.SealTime); err != nil {
+		return time.Time{}, err
+	}
+	return sealTime, nil
+}
+
 // CheckGenesis checks that the RRR consensus configuration in the genesis block
 // is correct.
 func (r *EndorsmentProtocol) CheckGenesis(chain headerByNumberChainReader) error {
@@ -709,7 +742,7 @@ func (r *EndorsmentProtocol) NewSignedEndorsement(et *EngSignedEndorsement) {
 		return
 	}
 
-	r.logger.Info("RRR engSignedEndorsement",
+	r.logger.Debug("RRR engSignedEndorsement",
 		"r", r.Number, "self", r.nodeAddr.Hex(),
 		"endorser", et.EndorserID.Hex(), "intent", et.IntentHash.Hex())
 
