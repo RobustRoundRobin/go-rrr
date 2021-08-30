@@ -48,7 +48,7 @@ func (r *EndorsmentProtocol) StartRounds(b Broadcaster, chain EngineChainReader)
 	// ro = now - T(eR) = offset into expected round
 	ro := now.Sub(eR)
 	if ro < 0 {
-		r.logger.Info("RRR alignRoundState - future block", "ro", ro)
+		r.logger.Debug("RRR alignRoundState - future block", "ro", ro)
 		ro = time.Duration(0)
 	}
 
@@ -113,14 +113,18 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 
 	switch r.Phase {
 	case RoundPhaseIntent:
-		r.logger.Info("RRR PhaseTick - END OF INTENT .........", "r", r.Number)
+		r.logger.Debug("RRR PhaseTick - END OF INTENT .........", "r", r.Number)
 		if r.signedIntent != nil {
 
 			oldestSeen := r.signedIntent.NodeID.Address()
-			r.logger.Trace(
-				"RRR PhaseTick - intent - sending endorsement to oldest seen", "r", r.Number)
-			b.SendSignedEndorsement(oldestSeen, r.signedIntent)
+			r.logger.Info(
+				"RRR sending endorsement to oldest seen", "r", r.Number, "oldest", oldestSeen.Hex(), "seen", r.intentsSeen)
+			if err := b.SendSignedEndorsement(oldestSeen, r.signedIntent); err != nil {
+				r.logger.Info(
+					"RRR error sending endorsement", "r", r.Number, "oldest", oldestSeen.Hex(), "err", err)
+			}
 			r.signedIntent = nil
+			r.intentsSeen = 0
 		}
 
 		r.logger.Trace(
@@ -130,7 +134,7 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 		r.Phase = RoundPhaseConfirm
 
 	case RoundPhaseConfirm:
-		r.logger.Info("RRR PhaseTick - END OF CONFIRM .........", "r", r.Number)
+		r.logger.Debug("RRR PhaseTick - END OF CONFIRM .........", "r", r.Number)
 		switch r.state {
 
 		case RoundStateLeaderCandidate:
@@ -168,7 +172,7 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 		if roundAdvanced {
 			if roundBlockArrived && roundAdvanced {
 				// This means the new block arived in the aloted time.
-				r.logger.Info("RRR PhaseTick - ROUND SUCCESS ++++++++", "r", r.Number)
+				r.logger.Debug("RRR PhaseTick - ROUND SUCCESS ++++++++", "r", r.Number)
 			} else {
 
 				var role string
@@ -181,12 +185,12 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 					role = "none"
 				}
 
-				r.logger.Info(
+				r.logger.Debug(
 					"RRR PhaseTick - ROUND FAILED  xxxxxxxx",
 					"r", r.Number, "f", r.FailedAttempts,
 					"advanced", roundAdvanced, "newhead", roundBlockArrived, "ro", role)
 			}
-			r.logger.Info("RRR PhaseTick - END OF ROUND ---------", "r", r.Number)
+			r.logger.Debug("RRR PhaseTick - END OF ROUND ---------", "r", r.Number)
 		} else {
 
 			// The timers can't be perfectly acurate. Sometimes we come up
@@ -214,7 +218,7 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 		case offset < endConfirm:
 			r.Phase = RoundPhaseConfirm
 			r.T.Reset(endConfirm - offset)
-			r.logger.Debug(
+			r.logger.Info(
 				"RRR PhaseTick - skipped intent phase (catchup)",
 				"r", r.Number, "o", offset, "advanced", roundAdvanced)
 		case offset <= endRound:
@@ -227,6 +231,10 @@ func (r *EndorsmentProtocol) PhaseTick(b Broadcaster, chain EngineChainReader) {
 		default:
 			r.logger.Warn("RRR PhaseTick - round offset to large", "offset", offset, "advanced", roundAdvanced)
 		}
+
+		// The buffer only lives till the start of the next round. regardless of
+		// whether we call electAndPropose, we start the new round afresh.
+		r.deferredIntents = make(map[Address]*EngSignedIntent)
 
 		// If we have gone idle, attempt to re-enrol
 		r.autoEnrolSelf(b)
@@ -247,29 +255,42 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 	n := r.getNumEndorsements()
 	switch {
 	case n < 0:
-		r.logger.Debug("RRR no outstanding intent")
+		r.logger.Info("RRR no outstanding intent")
 		return
+	case n == 0:
+		if r.a.OldestSelected() == r.nodeAddr {
+			r.logger.Info("RRR oldest candidate got no endorsments", "r", r.Number, "self", r.nodeAddr.Hex())
+		} else {
+			r.logger.Debug("RRR no endorserments received", "r", r.Number, "self", r.nodeAddr.Hex())
+		}
+		return
+
 	case n < int(r.config.Quorum):
-		r.logger.Info("RRR insufficient endorsers to become leader",
-			"q", int(r.config.Quorum), "got", n)
+		if r.a.OldestSelected() == r.nodeAddr {
+			r.logger.Info("RRR oldest candidate leader got insufficient endorsments",
+				"r", r.Number, "self", r.nodeAddr.Hex(), "q", int(r.config.Quorum), "got", n)
+		} else {
+			r.logger.Debug("RRR candidate got insufficient endorsments",
+				"r", r.Number, "self", r.nodeAddr.Hex(), "q", int(r.config.Quorum), "got", n)
+		}
 		return
 	default:
 		r.logger.Info("RRR confirmed as leader",
-			"q", int(r.config.Quorum), "got", len(r.intent.Endorsements))
+			"r", r.Number, "self", r.nodeAddr.Hex(), "q", int(r.config.Quorum), "got", len(r.intent.Endorsements))
 
 		if r.sealTask == nil {
-			r.logger.Trace("RRR seal task canceled or discarded")
+			r.logger.Trace("RRR seal task canceled or discarded", "r", r.Number, "self", r.nodeAddr.Hex())
 			return
 		}
 
 		err := r.verifyEndorsements()
 		if err != nil {
-			r.logger.Info("RRR PhaseTick - verifyEndorsements", "err", err)
+			r.logger.Info("RRR leader failed to verify endorserments", "r", r.Number, "self", r.nodeAddr.Hex(), "err", err)
 			return
 		}
 		beta, pi, err := r.generateIntentSeedProof()
 		if err != nil {
-			r.logger.Info("RRR PhaseTick - generateIntentSeedProof", "err", err)
+			r.logger.Info("RRR leader failed to generate seed proof", "r", r.Number, "self", r.nodeAddr.Hex(), "err", err)
 			return
 		}
 
@@ -277,11 +298,9 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 		// so its an error if we can't
 		err = r.sealCurrentBlock(beta, pi, chain)
 		if err != nil {
-			r.logger.Warn("RRR PhaseTick - sealCurrentBlock", "err", err)
+			r.logger.Warn("RRR leader failed to seal current block", "r", r.Number, "self", r.nodeAddr.Hex(), "err", err)
 			return
 		}
-		r.logger.Info(
-			"RRR PhaseTick - sealed block", "addr", r.nodeAddr.Hex(), "r", r.Number)
 	}
 }
 
@@ -294,7 +313,7 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 
 	if r.a.IsActive(r.nodeAddr) && !r.a.IsIdle(r.Number, r.nodeAddr) {
-		r.logger.Info("RRR autoEnrolSelf - self is active")
+		r.logger.Debug("RRR autoEnrolSelf - self is active")
 		return
 	}
 
@@ -303,17 +322,17 @@ func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 	cands := r.a.NOldest(r.Number, int(r.config.Candidates*2))
 
 	if len(cands) == 0 {
-		r.logger.Info("RRR PhaseTick - no candidates found to re-enrol self")
+		r.logger.Debug("RRR autoEnrolSelf - no candidates found to re-enrol self")
 		return
 	}
 
 	rmsg, err := r.newEnrolIdentityMsg(r.nodeID, true)
 	if err != nil {
-		r.logger.Info("RRR PhaseTick - encoding auto reenrol msg", "err", err)
+		r.logger.Info("RRR autoEnrolSelf - encoding auto reenrol msg", "err", err)
 	}
 	msg, err := r.codec.EncodeToBytes(rmsg)
 	if err != nil {
-		r.logger.Info("RRR PhaseTick - encoding RMsgEnrol", "err", err.Error())
+		r.logger.Info("RRR autoEnrolSelf - encoding RMsgEnrol", "err", err.Error())
 		return
 	}
 
@@ -328,10 +347,10 @@ func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 
 	err = b.Broadcast(r.nodeAddr, peers, msg)
 	if err != nil {
-		r.logger.Info("RRR PhaseTick - Broadcasting RMsgEnrol", "err", err.Error())
+		r.logger.Info("RRR autoEnrolSelf - Broadcasting RMsgEnrol", "err", err.Error())
 		return
 	}
-	r.logger.Info("RRR PhaseTick - Broadcast RMsgEnrol", "self", r.nodeAddr.Hex())
+	r.logger.Debug("RRR autoEnrolSelf - Broadcast RMsgEnrol", "self", r.nodeAddr.Hex())
 }
 
 // setChainHead updates the chain head state variables *including* the Rand
@@ -433,8 +452,9 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 	defer r.intentMu.Unlock()
 
 	r.signedIntent = nil
+	r.intentsSeen = 0
 
-	r.logger.Info(
+	r.logger.Debug(
 		"RRR ACTIVE SAMPLE >>>>>>>>>",
 		"s", r.activeSample, "ns", r.selectionRand.NumSamplesRead(),
 		"r", r.Number, "bn", r.chainHead.GetNumber(), "#head", Hash(r.chainHead.Hash()).Hex())
@@ -451,7 +471,19 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 
 	// How many endorsing peers are online - check this regardles of
 	// leadership status.
-	r.onlineEndorsers = b.FindPeers(r.endorsers)
+
+	endorsers := map[Address]bool{}
+	for e := range r.endorsers {
+		if e == r.nodeAddr {
+			continue
+		}
+		endorsers[e] = true
+	}
+
+	r.onlineEndorsers = b.FindPeers(endorsers)
+	if len(endorsers) > len(r.onlineEndorsers) {
+		r.logger.Info("not fully connected to all endorserss", "connected", len(r.onlineEndorsers), "want", len(endorsers))
+	}
 
 	// XXX: TODO if we are not selected as leader, there is no harm in being in
 	// RoundStateEndorserCommittee. Also, we may not be able to directly
@@ -511,7 +543,7 @@ func (r *EndorsmentProtocol) setRoundForTime(now time.Time) (time.Duration, bool
 
 		newRound = true
 
-		r.logger.Info(
+		r.logger.Debug(
 			"RRR setRoundForTime - round change",
 			"rh", rh, "cur", r.Number, "new", round)
 		r.Number = round
@@ -576,7 +608,7 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 
 	r.logger.Trace("RRR alignFailedAttempts", "f", f, "fprevious", fprevious, "delta", f-fprevious)
 	if f < fprevious {
-		r.logger.Info("RRR alignFailedAttempts - noop, f < fprevious", "f", f, "fprevious", fprevious, "delta", fprevious-f)
+		r.logger.Debug("RRR alignFailedAttempts - noop, f < fprevious", "f", f, "fprevious", fprevious, "delta", fprevious-f)
 		return f
 	}
 
@@ -633,11 +665,33 @@ func (r *EndorsmentProtocol) electAndPropose(b Broadcaster) {
 	state, err := r.selectCandidatesAndEndorsers(b)
 	r.SetState(state) // valid on err
 	if err != nil {
-		r.logger.Info("RRR startRound - candidate and endorser election", "err", err)
+		r.logger.Info("RRR electAndPropose - candidate and endorser election", "err", err)
 		return
 	}
 
 	if r.state != RoundStateLeaderCandidate {
+
+		if r.state == RoundStateEndorserCommittee {
+
+			nbuffered := 0
+
+			// If we have any deferredIntents see if they are infact for this node
+			for addr, et := range r.deferredIntents {
+
+				if !r.candidates[addr] {
+					r.logger.Info("RRR electAndPropose - dropping buffered intent from non candidate",
+						"r", r.Number, "for", addr.Hex(), "self", r.nodeAddr.Hex())
+					continue
+				}
+				nbuffered++
+
+				r.NewSignedIntent(et)
+			}
+			if nbuffered != 0 {
+				r.logger.Info("RRR electAndPropose - consumed buffered intents",
+					"r", r.Number, "count", nbuffered, "self", r.nodeAddr.Hex())
+			}
+		}
 		return
 	}
 
@@ -646,7 +700,7 @@ func (r *EndorsmentProtocol) electAndPropose(b Broadcaster) {
 	}
 
 	if len(r.onlineEndorsers) < int(r.config.Quorum) {
-		r.logger.Debug(
+		r.logger.Info(
 			"RRR *** insufficient endorsers online ***", "round", r.Number,
 			"addr", r.nodeAddr.Hex(), "err", err)
 	}
@@ -658,12 +712,9 @@ func (r *EndorsmentProtocol) electAndPropose(b Broadcaster) {
 	// how long it has been since the local node was a leader
 	// candidate.
 	if err := r.refreshSealTask(r.chainHeadExtraHeader.Seed, r.Number); err != nil {
-		r.logger.Info("RRR newHead refreshSealTask", "err", err)
+		r.logger.Info("RRR electAndPropose - refreshSealTask", "err", err)
 		return
 	}
-
-	r.logger.Trace(
-		"RRR broadcasting intent", "addr", r.nodeAddr.Hex(), "r", r.Number)
 
 	// Make our peers aware of our intent for this round, this may get reset by
 	// the arival of a new sealing task

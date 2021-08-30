@@ -48,8 +48,8 @@ type EngineChainReader interface {
 
 type Peer interface {
 
-	// ConsensusMsg sends a consensus message to this peer
-	ConsensusMsg(data interface{}) error
+	// SendConsensus sends a consensus message to this peer
+	SendConsensus(data interface{}) error
 }
 
 type PeerFinder interface {
@@ -363,22 +363,6 @@ func (e *Engine) HandleMsg(peerAddr Address, msg []byte) (bool, error) {
 		return true, nil
 	}
 
-	// traditional broadcast gossip - the only termination condition is that a node sees the message twice.
-	// var handleErr error
-	// for _, addr := range rmsg.To {
-	// 	if addr == e.nodeAddr {
-	// 		handleErr = e.handleMsg(peerAddr, rmsg)
-	// 		break
-	// 	}
-	// }
-	// err = e.continueEndorserGossip(e, rmsg)
-	// if err != nil {
-	// 	e.logger.Trace("RRR HandleMsg - continueEndorserGossip", "r", e.Number, "err", err)
-	// }
-	// return true, handleErr
-
-	// delivery gossip
-
 	// For each recipient we have a direct peer connection, send it directly. If
 	// any are left continue the gossip. If none are left there is no point
 	// continuing the gossip - we know all recipients have recieved it at least
@@ -428,10 +412,11 @@ func (e *Engine) handleMsg(peerAddr Address, rmsg RMsg) error {
 		si := &EngSignedIntent{}
 
 		if si.Pub, err = e.codec.DecodeSignedIntent(&si.SignedIntent, rmsg.Raw); err != nil {
-			e.logger.Info("RRR Intent decodeverify failed", "err", err)
+			e.logger.Debug("RRR Intent decodeverify failed", "err", err)
 			return err
 		}
 
+		e.logger.Trace("RRR handleMsg - RMsgIntent", "for", si.Intent.NodeID.Address().Hex(), "end", e.nodeAddr.Hex())
 		if !e.PostIfRunning(si) {
 			e.logger.Info("RRR Intent engine not running")
 		}
@@ -446,11 +431,14 @@ func (e *Engine) handleMsg(peerAddr Address, rmsg RMsg) error {
 		if sc.Pub, err = e.codec.DecodeSignedEndorsement(
 			&sc.SignedEndorsement, rmsg.Raw); err != nil {
 
-			e.logger.Debug("RRR RMsgConfirm decodeverify failed", "err", err)
+			e.logger.Info("RRR RMsgConfirm decodeverify failed", "err", err)
 			return err
 		}
+		e.logger.Trace("RRR handleMsg - RMsgConfirm", "for", e.nodeAddr.Hex(), "from", sc.EndorserID.Address().Hex())
 
-		e.PostIfRunning(sc)
+		if !e.PostIfRunning(sc) {
+			e.logger.Info("RRR handleMsg - RMsgConfirm failed to post", "for", e.nodeAddr.Hex())
+		}
 		return nil
 
 	case RMsgEnrol:
@@ -537,7 +525,12 @@ func (e *Engine) peerSend(
 	// Send will error imediately on encoding problems. But otherwise it
 	// will block until the receiver consumes the message or the send times
 	// out. So we can not sensibly collect errors.
-	go peer.ConsensusMsg(msg)
+
+	go func() {
+		if err := peer.SendConsensus(msg); err != nil {
+			e.logger.Info("RRR peerSend - SendConsensus", "err", err)
+		}
+	}()
 	return nil
 }
 
@@ -670,7 +663,15 @@ func (e *Engine) VerifySeal(chain VerifyBranchChainReader, header BlockHeader) e
 }
 
 func (e *Engine) VerifyHeader(chain headerByHashChainReader, header BlockHeader) error {
+
+	h := header.Hash()
+
+	if v, ok := e.verifiedHeaderCache.Get(h); ok {
+		return v.(error)
+	}
 	_, err := e.EndorsmentProtocol.VerifyHeader(chain, header)
+
+	e.verifiedHeaderCache.Add(h, err)
 	return err
 }
 
@@ -685,19 +686,6 @@ func (e *Engine) VerifyBranchHeaders(
 func (e *Engine) Author(header BlockHeader) (Address, error) {
 
 	return e.headerSigner(header)
-}
-
-func (e *Engine) verifyHeader(chain headerByHashChainReader, header BlockHeader) error {
-
-	h := header.Hash()
-
-	if v, ok := e.verifiedHeaderCache.Get(h); ok {
-		return v.(error)
-	}
-	_, err := e.EndorsmentProtocol.VerifyHeader(chain, header)
-
-	e.verifiedHeaderCache.Add(h, err)
-	return err
 }
 
 func (e *Engine) headerSigner(header BlockHeader) (Address, error) {

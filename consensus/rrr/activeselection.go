@@ -34,6 +34,7 @@ type ActiveSelection interface {
 
 	IsIdle(roundNumber uint64, id Address) bool
 	NOldest(roundNumber uint64, n int) []Hash
+	OldestSelected() Address
 
 	NextActiveSample(roundNumber uint64, source dRNG, s []int) []int
 
@@ -164,6 +165,10 @@ type activeList struct {
 	// becameOldest is the round that lastOldest was set by AccumulateActive
 	becameOldest uint64
 
+	// oldestSelected is the address of oldest candidate selected by the most
+	// recent call to SelectCandidatesAndEndorsers
+	oldestSelected Address
+
 	selfNodeID Hash // for logging only
 	logger     Logger
 }
@@ -289,6 +294,12 @@ func (a *activeList) IsIdle(roundNumber uint64, id Address) bool {
 		return false
 	})
 	return found
+}
+
+// OldestSelected returns the oldest identity chosen by the last call to
+// SelectCandidatesAndEndorsers
+func (a *activeList) OldestSelected() Address {
+	return a.oldestSelected
 }
 
 func (a *activeList) NOldest(roundNumber uint64, n int) []Hash {
@@ -648,7 +659,7 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 
 	icur, cur := a.firstActiveElement(roundNumber, func(becameOldest uint64, pos int, el *list.Element) bool {
 		act := el.Value.(*idActivity)
-		a.logger.Info(
+		a.logger.Debug(
 			"RRR selectCandEs - skipped idle leader",
 			"cand", fmt.Sprintf("%s:%05d.%02d", act.nodeID.Address().Hex(), act.ageRound, act.genesisOrder),
 			"r", roundNumber, "ic", pos, "of", roundNumber-becameOldest, "ar", act.ageRound,
@@ -668,6 +679,7 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 	nIdle := icur
 
 	var next *list.Element
+	a.oldestSelected = Address{}
 
 	// Take the first nc that pass the "oldest for" rule
 	for ; cur != nil && len(candidates) < Nc; icur, cur = icur+1, cur.Prev() {
@@ -678,6 +690,9 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 
 		selection = append(selection, Address(addr)) // telemetry only
 		candidates[Address(addr)] = true
+		if (a.oldestSelected == Address{}) {
+			a.oldestSelected = addr
+		}
 
 		a.logger.Debug(
 			"RRR selectCandEs - C",
@@ -1048,7 +1063,7 @@ func (a *activeList) enrolIdentities(
 
 		// Did the block sealer sign the indidual enrolment.
 		if !a.codec.c.VerifySignature(sealerPub, u[:], e.Q[:64]) {
-			a.logger.Info("RRR enrolIdentities - verify failed",
+			a.logger.Debug("RRR enrolIdentities - verify failed",
 				"sealerID", sealerID.Hex(), "e.ID", e.ID.Hex(), "e.U", e.U.Hex())
 			return false, fmt.Errorf("sealer-id=`%s',id=`%s',u=`%s':%w",
 				sealerID.Hex(), e.ID.Hex(), u.Hex(), errEnrolmentNotSignedBySealer)
@@ -1098,7 +1113,7 @@ func (a *activeList) enrolIdentities(
 				"bn", blockNumber, "r", roundNumber, "#", block.Hex())
 			continue
 		}
-		a.logger.Info("RRR enroled identity", "id", enr.ID.Hex(), "o", order, "bn", blockNumber, "r", roundNumber, "#", block.Hex())
+		a.logger.Debug("RRR enroled identity", "id", enr.ID.Hex(), "o", order, "bn", blockNumber, "r", roundNumber, "#", block.Hex())
 
 		a.refreshAge(fence, enr.ID, block, blockNumber, roundNumber, order)
 	}

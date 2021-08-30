@@ -47,21 +47,20 @@ type pendingIntent struct {
 // we hang on to it until we are or we receive the next one.
 func (r *EndorsmentProtocol) NewSealTask(b Broadcaster, et *EngSealTask) {
 
-	r.logger.Trace("RRR engSealTask",
-		"state", r.state.String(), "addr", r.nodeAddr.Hex(),
-		"r", r.Number)
+	r.logger.Trace("RRR engSealTask", "r", r.Number,
+		"state", r.state.String(), "self", r.nodeAddr.Hex())
 
 	et.RoundNumber = r.Number
 
 	// Note: we don't reset the attempt if we get a new seal task.
 	if err := r.newSealTask(r.state, et, r.Number); err != nil {
-		r.logger.Info("RRR engSealTask - newSealTask", "err", err)
+		r.logger.Info("RRR engSealTask - newSealTask", "r", r.Number, "self", r.nodeAddr.Hex(), "err", err)
 	}
 
 	if r.state == RoundStateLeaderCandidate && r.Phase == RoundPhaseIntent {
 
-		r.logger.Trace(
-			"RRR engSealTask - broadcasting intent (new)", "addr", r.nodeAddr.Hex(), "r", r.Number)
+		r.logger.Info(
+			"RRR engSealTask - broadcasting intent (new)", "r", r.Number, "self", r.nodeAddr.Hex())
 
 		r.broadcastCurrentIntent(b)
 	}
@@ -78,6 +77,15 @@ func (r *EndorsmentProtocol) newSealTask(
 	if newIntent, err = r.newPendingIntent(
 		et, r.chainHeadExtraHeader.Seed, roundNumber); err != nil {
 		return err
+	}
+
+	if r.intent != nil && len(r.intent.Endorsements) > 0 {
+		var curCancelled bool
+		if r.sealTask != nil {
+			curCancelled = r.sealTask.Committer.Canceled()
+		}
+		r.logger.Info(
+			"RRR new seal task discarding previous endorsments", "r", r.Number, "self", r.nodeAddr.Hex(), "n", len(r.intent.Endorsements), "cur-canceled", curCancelled)
 	}
 
 	r.intent = newIntent
@@ -102,7 +110,7 @@ func (r *EndorsmentProtocol) refreshSealTask(parentSeed []byte, roundNumber uint
 	if r.sealTask == nil || r.sealTask.Committer.Canceled() {
 		r.intent = nil
 		r.sealTask = nil
-		r.logger.Trace("RRR refreshSealTask - no task")
+		r.logger.Info("RRR refreshSealTask - no task or task canceled")
 		return nil
 	}
 
@@ -223,7 +231,9 @@ func (r *EndorsmentProtocol) sealCurrentBlock(beta, pi []byte, chain sealChainRe
 		return fmt.Errorf("no sealTask to seal")
 	}
 
-	sealTimeBytes, err := time.Now().UTC().MarshalBinary()
+	sealTime := time.Now()
+
+	sealTimeBytes, err := sealTime.UTC().MarshalBinary()
 	if err != nil {
 		return fmt.Errorf("failed marshaling seal time: %v", err)
 	}
@@ -254,7 +264,7 @@ func (r *EndorsmentProtocol) sealCurrentBlock(beta, pi []byte, chain sealChainRe
 		addr := eb.NodeID.Address()
 
 		if r.a.IsActive(addr) && !r.a.IsIdle(r.Number, addr) {
-			r.logger.Info(
+			r.logger.Debug(
 				"RRR sealCurrentBlock - ignoring redundant enrolment",
 				"node", eb.NodeID.Hex(), "addr", addr.Hex())
 			continue
@@ -282,6 +292,18 @@ func (r *EndorsmentProtocol) sealCurrentBlock(beta, pi []byte, chain sealChainRe
 	}
 
 	r.sealTask.Committer.CommitSeal(seal)
+	due := time.Unix(int64(r.sealTask.BlockHeader.GetTime()), 0)
+	delta := time.Since(due)
+	r.logger.Info(
+		"RRR sealed block",
+		"r", r.Number,
+		"rs", data.Intent.RoundNumber, // r and rs should be equal
+		"bn", r.sealTask.BlockHeader.GetNumber(),
+		"delta", delta,
+		"due", due,
+		"sealed", sealTime.UTC(),
+		"sealer", r.nodeAddr.Hex(),
+		"#", Hash(r.sealTask.BlockHeader.Hash()).Hex())
 
 	r.sealTask = nil
 	r.intent = nil
