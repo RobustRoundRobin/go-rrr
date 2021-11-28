@@ -71,7 +71,7 @@ type headerByHashChainReader interface {
 	GetHeaderByHash([32]byte) BlockHeader
 }
 
-type dRNG interface {
+type DRNG interface {
 	Intn(n int) int
 	NumSamplesRead() int
 }
@@ -106,8 +106,8 @@ type EndorsmentProtocol struct {
 	vrf ecvrf.VRF
 	T   RoundTime
 
-	selectionRand dRNG
-	gossipRand    dRNG
+	selectionRand DRNG
+	gossipRand    DRNG
 	// Updated in the NewChainHead method
 	chainHead            BlockHeader
 	chainHeadExtraHeader *ExtraHeader     // genesis & consensus blocks

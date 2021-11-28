@@ -29,14 +29,13 @@ type ActiveSelection interface {
 	// AccumulateActive should be called each time a new block arrives to
 	// maintain the active selection of candidates and endorsers.
 	AccumulateActive(
-		roundNumber uint64, chainID Hash, chain blockHeaderReader, head BlockHeader,
+		roundNumber uint64, chainID Hash, chain BlockHeaderReader, head BlockHeader,
 	) error
+	NumActive() int
 
-	IsIdle(roundNumber uint64, id Address) bool
-	NOldest(roundNumber uint64, n int) []Hash
-	OldestSelected() Address
+	NOldest(roundNumber uint64, n int) []Address
 
-	NextActiveSample(roundNumber uint64, source dRNG, s []int) []int
+	NextActiveSample(roundNumber uint64, source DRNG, s []int) []int
 
 	// SelectCandidatesAndEndorsers should be called once a round with a fresh
 	// permutation of indices into the active selection. There must be exactly
@@ -53,15 +52,11 @@ type ActiveSelection interface {
 	// far back as head - ta but no further
 	Prime(head BlockHeader)
 
-	YoungestNodeID() Hash
-
 	// AgeOf returns the age of the identity. The boolean return is false if the
 	// identity is not active.
 	AgeOf(nodeID Address) (uint64, bool)
 
-	MinViableSelection() int
-	NumActive() int
-	IsActive(addr Address) bool
+	IsActive(roundNumber uint64, addr Address) bool
 }
 
 func NewActiveSelection(
@@ -165,10 +160,6 @@ type activeList struct {
 	// becameOldest is the round that lastOldest was set by AccumulateActive
 	becameOldest uint64
 
-	// oldestSelected is the address of oldest candidate selected by the most
-	// recent call to SelectCandidatesAndEndorsers
-	oldestSelected Address
-
 	selfNodeID Hash // for logging only
 	logger     Logger
 }
@@ -179,30 +170,25 @@ func (a *activeList) NumActive() int {
 	return a.activeSelection.Len()
 }
 
-func (a *activeList) IsActive(addr Address) bool {
+func (a *activeList) IsActive(roundNumber uint64, addr Address) bool {
 	_, ok := a.aged[addr]
-	return ok
+	return ok && !a.isIdle(roundNumber, addr)
 }
 
-func (a *activeList) YoungestNodeID() Hash {
-
-	return a.activeSelection.Front().Value.(*idActivity).nodeID
-}
-
-// MinViableSelection returns the smallest size of network the consensus
+// minViableSelection returns the smallest size of network the consensus
 // parameters guarantee liveness for. When the active selection is smaller than
 // this, the network will halt until and unless the Nc oldest identities are
 // online.
-func (a *activeList) MinViableSelection() int {
+func (a *activeList) minViableSelection() int {
 	return int(a.config.Candidates + a.config.Endorsers)
 }
 
-// MaxIdle returns the number of identities in the active selection that
+// maxIdle returns the number of identities in the active selection that
 // can go idle without rendering the network inoperable. Strictly this should
 // be  max(0, len(active) - (Nc + Q)). But that doesn't allow for any endorsers
 // to be offline so we make it max(0, len(active) - (Nc + Ne)).
-func (a *activeList) MaxIdle() int {
-	x := a.activeSelection.Len() - a.MinViableSelection()
+func (a *activeList) maxIdle() int {
+	x := a.activeSelection.Len() - a.minViableSelection()
 	if x < 0 {
 		x = 0
 	}
@@ -233,7 +219,7 @@ type idleCallback func(becameOldest uint64, pos int, el *list.Element) bool
 
 func (a *activeList) firstActiveElement(roundNumber uint64, callbacks ...idleCallback) (int, *list.Element) {
 
-	maxIdle := a.MaxIdle()
+	maxIdle := a.maxIdle()
 
 	// initialise becameOldest for the oldest identity in the current active
 	// selection. This is only used for the first item. The subsequent items
@@ -281,8 +267,8 @@ func (a *activeList) firstActiveElement(roundNumber uint64, callbacks ...idleCal
 	return icur, cur
 }
 
-// IsIdle returns true if the address is in the idle leaders
-func (a *activeList) IsIdle(roundNumber uint64, id Address) bool {
+// isIdle returns true if the address is in the idle leaders
+func (a *activeList) isIdle(roundNumber uint64, id Address) bool {
 
 	var found = false
 
@@ -296,20 +282,14 @@ func (a *activeList) IsIdle(roundNumber uint64, id Address) bool {
 	return found
 }
 
-// OldestSelected returns the oldest identity chosen by the last call to
-// SelectCandidatesAndEndorsers
-func (a *activeList) OldestSelected() Address {
-	return a.oldestSelected
-}
+func (a *activeList) NOldest(roundNumber uint64, n int) []Address {
 
-func (a *activeList) NOldest(roundNumber uint64, n int) []Hash {
-
-	var cands []Hash
+	var cands []Address
 
 	// Skip past the idle
 	for _, cur := a.firstActiveElement(
 		roundNumber); cur != nil && len(cands) < n; cur = cur.Prev() {
-		cands = append(cands, cur.Value.(*idActivity).nodeID)
+		cands = append(cands, cur.Value.(*idActivity).nodeID.Address())
 	}
 	return cands
 }
@@ -370,15 +350,15 @@ func (a *activeList) Prime(head BlockHeader) {
 	// 'activity' in the genesis block.
 }
 
-// blockHeaderReader defines the interface required by AccumulateActive
-type blockHeaderReader interface {
+// BlockHeaderReader defines the interface required by AccumulateActive
+type BlockHeaderReader interface {
 	GetHeaderByHash(hash [32]byte) BlockHeader
 }
 
 // AccumulateActive is effectively SelectActive from the paper, but with the
 // 'obvious' caching optimisations.
 func (a *activeList) AccumulateActive(
-	roundNumber uint64, chainID Hash, chain blockHeaderReader, head BlockHeader,
+	roundNumber uint64, chainID Hash, chain BlockHeaderReader, head BlockHeader,
 ) error {
 
 	var err error
@@ -406,7 +386,7 @@ func (a *activeList) AccumulateActive(
 				"r", roundNumber, "ic", pos, "of", roundNumber-becameOldest, "ar", act.ageRound,
 			)
 
-			if a.activeSelection.Len() <= a.MinViableSelection() {
+			if a.activeSelection.Len() <= a.minViableSelection() {
 				// Note: We could restore this guarantee if we re-introduced the failed
 				// attempts mechanism from the "block clock" implementation. I may still
 				// do that as a configuration item.
@@ -587,7 +567,7 @@ func (a *activeList) AccumulateActive(
 // replacement.  This is contrary to the paper because replacement causes issues
 // for small networks in the case where endorsers are selected more than once by
 // the same permutation.
-func (a *activeList) NextActiveSample(roundNumber uint64, source dRNG, s []int) []int {
+func (a *activeList) NextActiveSample(roundNumber uint64, source DRNG, s []int) []int {
 	// divergence (3) we do sample *without* replacement because replacement
 	// predjudices the quorum in small networks (and network initialisation)
 
@@ -665,7 +645,7 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 			"r", roundNumber, "ic", pos, "of", roundNumber-becameOldest, "ar", act.ageRound,
 		)
 
-		if a.activeSelection.Len()-pos <= a.MinViableSelection() {
+		if a.activeSelection.Len()-pos <= a.minViableSelection() {
 			// Note: We could restore this guarantee if we re-introduced the failed
 			// attempts mechanism from the "block clock" implementation. I may still
 			// do that as a configuration item.
@@ -679,7 +659,6 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 	nIdle := icur
 
 	var next *list.Element
-	a.oldestSelected = Address{}
 
 	// Take the first nc that pass the "oldest for" rule
 	for ; cur != nil && len(candidates) < Nc; icur, cur = icur+1, cur.Prev() {
@@ -690,9 +669,6 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 
 		selection = append(selection, Address(addr)) // telemetry only
 		candidates[Address(addr)] = true
-		if (a.oldestSelected == Address{}) {
-			a.oldestSelected = addr
-		}
 
 		a.logger.Debug(
 			"RRR selectCandEs - C",
@@ -769,7 +745,7 @@ func (a *activeList) SelectCandidatesAndEndorsers(
 // for theoretical background and pseudo code. The methods guarantee that any
 // single element would be selected with P nEndorsers/nActive
 
-func RandSampleRange(source dRNG, limit int, s []int) []int {
+func RandSampleRange(source DRNG, limit int, s []int) []int {
 
 	nsamples := len(s)
 
@@ -815,7 +791,7 @@ func RandSampleRange(source dRNG, limit int, s []int) []int {
 	return s
 }
 
-func RandSelect(source dRNG, limit, nsamples int) map[int]bool {
+func RandSelect(source DRNG, limit, nsamples int) map[int]bool {
 
 	s := map[int]bool{}
 
@@ -1239,61 +1215,4 @@ func (a *activeList) refreshAge(
 	if blockNumber == 0 {
 		aged.genesisOrder = order
 	}
-}
-
-// The cursor arrangement only exists to support testing
-type selectionCursor struct {
-	selection *list.List
-	cur       *list.Element
-}
-
-type ActivityCursor interface {
-	Back() ActivityCursor
-	Prev() ActivityCursor
-	Front() ActivityCursor
-	Next() ActivityCursor
-	NodeID() Hash
-}
-
-// NewActiveSelectionCursor creates a cursor over the active selection. This is
-// provided to facilitate testing from external packages. It may get withdrawn
-// without notice.
-func NewActiveSelectionCursor(a ActiveSelection) ActivityCursor {
-
-	al := a.(*activeList) // will panic if a is not an activeList
-
-	// activeList
-	cur := &selectionCursor{selection: al.activeSelection}
-	return cur
-}
-
-func (cur *selectionCursor) Back() ActivityCursor {
-	cur.cur = cur.selection.Back()
-	return cur
-}
-
-func (cur *selectionCursor) Prev() ActivityCursor {
-	cur.cur = cur.cur.Prev()
-	if cur.cur == nil {
-		return nil
-	}
-	return cur
-}
-
-func (cur *selectionCursor) Front() ActivityCursor {
-	cur.cur = cur.selection.Front()
-	return cur
-}
-
-func (cur *selectionCursor) Next() ActivityCursor {
-	cur.cur = cur.cur.Next()
-	if cur.cur == nil {
-		return nil
-	}
-	return cur
-}
-
-func (cur *selectionCursor) NodeID() Hash {
-	age := cur.cur.Value.(*idActivity)
-	return age.nodeID
 }

@@ -258,7 +258,7 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 		r.logger.Info("RRR no outstanding intent")
 		return
 	case n == 0:
-		if r.a.OldestSelected() == r.nodeAddr {
+		if r.a.NOldest(r.Number, 1)[0] == r.nodeAddr {
 			r.logger.Info("RRR oldest candidate got no endorsments", "r", r.Number, "self", r.nodeAddr.Hex())
 		} else {
 			r.logger.Debug("RRR no endorserments received", "r", r.Number, "self", r.nodeAddr.Hex())
@@ -266,7 +266,7 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 		return
 
 	case n < int(r.config.Quorum):
-		if r.a.OldestSelected() == r.nodeAddr {
+		if r.a.NOldest(r.Number, 1)[0] == r.nodeAddr {
 			r.logger.Info("RRR oldest candidate leader got insufficient endorsments",
 				"r", r.Number, "self", r.nodeAddr.Hex(), "q", int(r.config.Quorum), "got", n)
 		} else {
@@ -312,7 +312,7 @@ func (r *EndorsmentProtocol) completeLeaderConfirmPhase(chain sealChainReader) {
 // re-enrolment and to ensure we send the enrolment to nodes we know to be live.
 func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 
-	if r.a.IsActive(r.nodeAddr) && !r.a.IsIdle(r.Number, r.nodeAddr) {
+	if r.a.IsActive(r.Number, r.nodeAddr) {
 		r.logger.Debug("RRR autoEnrolSelf - self is active")
 		return
 	}
@@ -337,11 +337,11 @@ func (r *EndorsmentProtocol) autoEnrolSelf(b Broadcaster) {
 	}
 
 	m := map[Address]bool{}
-	for _, id := range cands {
-		if id == r.nodeID {
+	for _, addr := range cands {
+		if addr == r.nodeID.Address() {
 			continue
 		}
-		m[id.Address()] = true
+		m[addr] = true
 	}
 	peers := b.FindPeers(m)
 
@@ -736,7 +736,7 @@ func (r *drng) NumSamplesRead() int {
 	return r.nSamples
 }
 
-func randFromSeed(seed uint64) dRNG {
+func randFromSeed(seed uint64) DRNG {
 	r := drng{
 		Rand: rand.New(rand.NewSource(int64(seed))),
 	}
