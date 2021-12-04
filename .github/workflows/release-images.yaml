@@ -19,7 +19,6 @@ jobs:
         name: checkout go-rrr
         uses: actions/checkout@v2
         with:
-          ref: "${{.RRR_VERSION}}"
           path: go-rrr
           token: ${{ github.token }}
 
