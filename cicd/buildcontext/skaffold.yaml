@@ -1,0 +1,37 @@
+# skaffold build -t latest -d ""
+apiVersion: skaffold/v2beta10
+kind: Config
+build:
+  local:
+    push: false
+    concurrency: 8
+    useBuildkit: true
+  artifacts:
+    - image: geth-rrr
+      context: .
+    - image: rrr-delve
+      context: .
+      docker:
+        dockerfile: Dockerfile-delve
+profiles:
+  - name: cloud
+    build:
+      local:
+        push: true
+        concurrency: 8
+        useBuildkit: true
+      artifacts:
+        - image: geth-rrr
+          context: .
+
+  - name: tools
+    build:
+      local:
+        push: false
+        concurrency: 8
+        useBuildkit: true
+      artifacts:
+        - image: rrrctl
+          context: .
+          docker:
+            dockerfile: Dockerfile-rrrctl

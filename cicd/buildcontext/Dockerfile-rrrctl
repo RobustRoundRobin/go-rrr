@@ -1,0 +1,46 @@
+FROM golang:1.15-buster as go-builder
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+  && apt-get upgrade -y --no-install-recommends \
+  && apt-get install -y \
+        git \
+        build-essential
+
+ENV GOBIN=/go/bin
+
+WORKDIR /build/go-rrr/consensus
+COPY go-rrr/consensus/go.mod go-rrr/consensus/go.sum ./
+RUN go mod download
+
+WORKDIR /build/go-rrr/secp256k1suite
+COPY go-rrr/secp256k1suite/go.mod go-rrr/secp256k1suite/go.sum ./
+RUN go mod download
+
+WORKDIR /build/quorum
+COPY quorum/go.mod quorum/go.sum ./
+RUN go mod download
+
+WORKDIR /build/go-rrr/tools
+COPY go-rrr/tools/go.mod go-rrr/tools/go.sum ./
+RUN go mod download
+
+ADD go-rrr /build/go-rrr
+ADD quorum /build/quorum
+
+RUN go install github.com/RobustRoundRobin/go-rrr/tools/cmd/rrrctl
+
+FROM debian:buster-slim
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+  && apt-get upgrade -y --no-install-recommends \
+  && apt-get install -y \
+      ca-certificates \
+  && apt-get clean autoclean \
+  && apt-get autoremove --yes \
+  && rm -rf /var/lib/{apt,dpkg,cache,log}/
+
+
+COPY --from=go-builder /go/bin/rrrctl /usr/local/bin/
+
+ENTRYPOINT ["rrrctl"]
+

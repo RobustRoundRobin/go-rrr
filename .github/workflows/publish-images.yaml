@@ -1,0 +1,75 @@
+name: Build and publish geth-rrr image -x
+env:
+  DOCKERHUB_USERNAME: robinbryce
+on: [push]
+jobs:
+  build-and-publish-images:
+    name: Build and publish geth-rrr image
+    runs-on: ubuntu-latest
+    steps:
+
+      -
+        name: checkout go-rrr
+        uses: actions/checkout@v2
+        with:
+          path: go-rrr
+          token: ${{ github.token }}
+
+      -
+        name: checkout quorum
+        uses: actions/checkout@v2
+        with:
+          repository: RobustRoundRobin/quorum
+          path: quorum
+          token: ${{ github.token }}
+      -
+        name: copy buildcontext files
+        run: |
+          cp go-rrr/cicd/buildcontext/* $GITHUB_WORKSPACE/
+      -
+        name: Login to dockerhub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v1
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PUBLISH }}
+      -
+        name: Extract tags, labels for geth image
+        id: geth-meta
+        uses: docker/metadata-action@v3
+        with:
+          images: robustroundrobin/geth
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      -
+        name: Build and push geth
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.geth-meta.outputs.tags }}
+          labels: ${{ steps.geth-meta.outputs.labels }}
+      -
+        name: Extract tags, labels for rrrctl image
+        id: rrrctl-meta
+        uses: docker/metadata-action@v3
+        with:
+          images: robustroundrobin/rrrctl
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      -
+        name: Build and push rrrctl
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: Dockerfile-rrrctl
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.rrrctl-meta.outputs.tags }}
+          labels: ${{ steps.rrrctl-meta.outputs.labels }}
