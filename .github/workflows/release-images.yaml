@@ -22,7 +22,7 @@ jobs:
           # that final release fails for an intermitent reason that requires a fixup,
           # force retag the fixup or start again with a new tag
           echo "QUORUM_RRR_VERSION=${GITHUB_REF_NAME%-*}" >> $GITHUB_ENV
-          echo QUORUM_RRR_VERSION=$QUORUM_RRR_VERSION
+          tail -n 1 $GITHUB_ENV
 
       -
         name: checkout go-rrr
@@ -61,7 +61,7 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
+            type=sha,prefix={{branch}}sha-
       -
         name: Build and push geth
         uses: docker/build-push-action@v2
@@ -81,7 +81,7 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
+            type=sha,prefix={{branch}}sha-
 
       -
         name: Build and push rrrctl
