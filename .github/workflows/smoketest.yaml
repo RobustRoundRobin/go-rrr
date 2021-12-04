@@ -17,7 +17,7 @@ jobs:
       cluster_name: "kluster"
       consensus: raft
       numnodes: 3
-      namespaceprefix: ${{ env.NAMESPACEPREFIX }}
+      namespaceprefix: ${{ NAMESPACEPREFIX }}
       maxwait: ${{ env.MAXWAIT }}
 
     secrets:
@@ -32,8 +32,8 @@ jobs:
       consensus: "ibft"
       numnodes: 5
       profile: ${{ github.event.inputs.profile }}
-      namespaceprefix: ${{ env.NAMESPACEPREFIX }}
-      maxwait: ${{ env.MAXWAIT }}
+      namespaceprefix: "go-rrr-smoketest-"
+      maxwait: "360"
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
@@ -47,8 +47,8 @@ jobs:
       consensus: "rrr"
       numnodes: 9
       profile: ${{ github.event.inputs.profile }}
-      namespaceprefix: ${{ env.NAMESPACEPREFIX }}
-      maxwait: ${{ env.MAXWAIT }}
+      namespaceprefix: "go-rrr-smoketest-"
+      maxwait: "360"
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
