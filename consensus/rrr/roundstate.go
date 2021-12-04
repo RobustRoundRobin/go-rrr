@@ -211,9 +211,9 @@ func NewRoundState(
 
 	if logger != nil {
 		logger.Trace(
-			"RRR NewRoundState - timer durations",
+			"RRR NewRoundState - timer durations & method",
 			"round", r.T.Intent+r.T.Confirm+r.T.Broadcast,
-			"i", r.T.Intent, "c", r.T.Confirm, "b", r.T.Broadcast)
+			"i", r.T.Intent, "c", r.T.Confirm, "b", r.T.Broadcast, "method", config.ActivityMethod)
 	}
 
 	return r
@@ -340,7 +340,12 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 		return nil
 	}
 
-	r.a = NewActiveSelection(r.config, r.codec, r.nodeID, r.logger)
+	switch r.config.ActivityMethod {
+	case RRRActiveMethodSortEndorsers:
+		r.a = NewActiveSelection3(r.config, r.codec, r.nodeID, r.logger)
+	case RRRActiveMethodSampleAged:
+		r.a = NewActiveSelection(r.config, r.codec, r.nodeID, r.logger)
+	}
 
 	header := chain.CurrentHeader()
 	r.a.Reset(header)

@@ -1,5 +1,10 @@
 package rrr
 
+const (
+	RRRActiveMethodSortEndorsers = "sortendorsers"
+	RRRActiveMethodSampleAged    = "sampleaged"
+)
+
 // Config carries the RRR consensus configuration
 type Config struct {
 	IntentPhase  uint64 `toml:",omitempty"` // How long endorsers wait to decide the oldes leader
@@ -17,6 +22,12 @@ type Config struct {
 	// agressive idling in small networks.
 	MinIdleAttempts uint64 `toml:"omitempty"`
 	GossipFanout    int    `toml:"omitempty"`
+
+	// ActivityMethod selects one of the alternative implementations for
+	// tracking identity activity
+	// sortendorsers - closest to paper, simplest implementation, may struggle with > 10000s of identities
+	// sampleaged - maintains all idenities in age order all the time and does not sort in SelectActive
+	ActivityMethod string `toml:"ommitempty"`
 }
 
 // DefaultConfig provides the default rrr consensus configuration
@@ -31,4 +42,5 @@ var DefaultConfig = &Config{
 	StablePrefixDepth: 6,
 	MinIdleAttempts:   5,
 	GossipFanout:      4,
+	ActivityMethod:    RRRActiveMethodSortEndorsers,
 }

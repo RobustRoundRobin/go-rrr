@@ -35,6 +35,7 @@ func NewActiveSelection3(
 	if a.config.Candidates > a.config.MinIdleAttempts {
 		a.idleRoundLimit = a.config.Candidates
 	}
+	logger.Debug("RRR NewActiveSelection3", "idleRoundLimit", a.idleRoundLimit)
 
 	return a
 }
@@ -167,25 +168,42 @@ func (a *activity) AccumulateActive(
 		"RRR AccumulateActive - for block", "r", roundNumber, "hr", headActivity.RoundNumber,
 		"a", len(a.active), "bn", headNumber, "#", headHash.Hex())
 
-	a.aged = a.sortedByAge(nil)
+	a.aged = a.sortedByAgeExcluding(nil)
+
+	// Deal with culling of idles do to lack of activity. activity means
+	// producing a block or endorsing a block.  We chose do this based on the
+	// block number the activity was recorded for (the :paper: is a little
+	// ambiguous on this point). This makes network startup, consensus restart,
+	// and recovery from long periods of network inavailability much cleaner. If
+	// the network is not active, blocks are not produced by any candidate, and
+	// liveness is not going to be improved by removing identities from the
+	// active set. This means the only way for the active set to diverge based
+	// on time (rather than block height) is due to the application of the
+	// oldest for rule to the oldest candidate in successive calls to
+	// SelectCandidates
 
 	var i int
 	var p *Participant
 	for i, p = range a.aged {
 
 		addr := p.nodeID.Address()
-		lastActiveRound := p.ageRound
-		if p.endorsedRound > p.ageRound {
-			lastActiveRound = p.endorsedRound
+		lastActiveBlock := p.ageBlock
+		if p.endorsedBlock > p.ageBlock {
+			lastActiveBlock = p.endorsedBlock
 		}
 
-		if lastActiveRound >= activeHorizon {
+		if lastActiveBlock >= activeHorizon {
+			break
+		}
+
+		if len(a.active) < int(a.config.Candidates)+int(a.config.Endorsers) {
+			a.logger.Trace("RRR AccumulateActive - aborting activity horizon cull (only nc+ne left)")
 			break
 		}
 
 		a.logger.Trace("RRR AccumulateActive - identity fell below activity horizon",
-			"gi", p.genesisOrder, "end", p.endorsedRound,
-			"last", p.ageRound, "id", addr.Hex())
+			"gi", p.genesisOrder, "end", p.endorsedBlock,
+			"last", p.ageBlock, "id", addr.Hex())
 
 		delete(a.active, p.nodeID.Address())
 	}
@@ -210,11 +228,7 @@ func (a *activity) NOldest(roundNumber uint64, n int) []Address {
 
 func (a *activity) NextActiveSample(roundNumber uint64, source DRNG, s []int) []int {
 
-	nactive := len(a.active) - int(a.config.Candidates)
-
-	if len(a.active) == 0 {
-		panic("RRR NextActiveSample must not be called unless there is a current active selection")
-	}
+	nactive := a.NumActive()
 
 	nsamples := len(s)
 
@@ -251,41 +265,27 @@ func (a *activity) SelectCandidatesAndEndorsers(
 			break
 		}
 
-		// oldestFor idle rule
-
-		// Once the identity produces a block its agedRound will be updated
-		// to equal the candidate round and we wont see it again until it
-		// cycles back to the front. At which point the current candidate
-		// round will be > the agedRound again, but the last recorded
-		// candidateRound on p is still == agedRound.
-		if p.ageRound >= p.candidateRound && p.ageRound != 0 {
-			if p.ageRound > p.candidateRound {
-				a.logger.Debug(
-					"RRR selectCandEs - participant age in future", "pa", p.ageRound, "pcr", p.candidateRound)
-			}
-			p.failedRounds = 0
-		} else {
-			d := roundNumber - p.candidateRound
-			if uint64(i) < d {
-				p.failedRounds += d - uint64(i)
-			}
-
-			if p.failedRounds > a.idleRoundLimit {
-				delete(a.active, p.nodeID.Address())
-				a.logger.Debug(
-					"RRR selectCandEs - dropped idle leader",
-					"cand", fmt.Sprintf("%s:%05d.%02d", p.nodeID.Address().Hex(), p.ageRound, p.genesisOrder),
-					"r", roundNumber, "ar", p.ageRound,
-				)
-				continue
-			}
+		// if we don't have at least Nc+Ne endorsers don't apply the idles rule.
+		if len(a.active) <= (int(a.config.Candidates) + int(a.config.Endorsers)) {
+			candidates[p.nodeID.Address()] = true
+			continue
 		}
 
-		p.candidateRound = roundNumber
-		candidates[p.nodeID.Address()] = true
+		// oldestFor idle rule
+		if !p.oldestForIdleRule(i, roundNumber, a.idleRoundLimit) {
+			candidates[p.nodeID.Address()] = true
+			continue
+		}
+
+		delete(a.active, p.nodeID.Address())
+		a.logger.Debug(
+			"RRR selectCandEs - dropped idle leader",
+			"cand", fmt.Sprintf("%s:%05d.%02d", p.nodeID.Address().Hex(), p.ageBlock, p.genesisOrder),
+			"r", roundNumber, "ar", p.ageBlock,
+		)
 	}
 
-	byid := a.sortedById(candidates)
+	byid := a.sortedByIdExcluding(candidates)
 
 	mperm := map[int]bool{}
 	for _, i := range permutation {
@@ -342,7 +342,7 @@ func (a *activity) Prime(head BlockHeader) {
 
 func (a *activity) AgeOf(nodeAddr Address) (uint64, bool) {
 	if p, ok := a.active[nodeAddr]; ok {
-		return p.ageRound, true
+		return p.ageBlock, true
 	}
 	return 0, false
 }
@@ -369,6 +369,7 @@ func (a *activity) recordActivity(nodeID Hash, endorsed Hash, blockNumber, round
 		}
 		a.active[nodeAddr] = p
 	}
+	p.endorsedBlock = blockNumber
 	p.endorsedRound = roundNumber
 
 	return p
@@ -474,9 +475,13 @@ func (a *activity) refreshAge(
 		a.active[nodeAddr] = p
 	}
 
+	if p.ageBlock <= blockNumber {
+		p.ageBlock = blockNumber
+		p.order = order
+	}
+
 	if p.ageRound <= roundNumber {
 		p.ageRound = roundNumber
-		p.order = order
 	}
 
 	if blockNumber == 0 {
@@ -484,7 +489,7 @@ func (a *activity) refreshAge(
 	}
 }
 
-func (a *activity) sortedByAge(excluding map[Address]bool) []*Participant {
+func (a *activity) sortedByAgeExcluding(excluding map[Address]bool) []*Participant {
 	s := make([]*Participant, 0, len(a.active))
 	for _, p := range a.active {
 		if excluding[p.nodeID.Address()] {
@@ -496,7 +501,7 @@ func (a *activity) sortedByAge(excluding map[Address]bool) []*Participant {
 	return s
 }
 
-func (a *activity) sortedById(excluding map[Address]bool) []*Participant {
+func (a *activity) sortedByIdExcluding(excluding map[Address]bool) []*Participant {
 	s := make([]*Participant, 0, len(a.active))
 	for _, p := range a.active {
 		if excluding[p.nodeID.Address()] {
