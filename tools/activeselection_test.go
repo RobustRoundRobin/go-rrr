@@ -3,10 +3,13 @@ package tools_test
 // Tests for go-rrr/consensus/rrr
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -45,6 +48,96 @@ func defaultConfig() *rrr.Config {
 		Endorsers:  8,
 		Quorum:     5,
 	}
+}
+
+func sorter(s [][]byte) {
+
+	less := func(i, j int) bool {
+		if i >= len(s) {
+			return false
+		}
+		if j >= len(s) {
+			return false
+		}
+		return bytes.Compare(s[i], s[j]) == -1
+	}
+	sort.Slice(s, less)
+}
+
+func TestSortPubs(t *testing.T) {
+
+	count := 1000
+	N := 10
+	keys := make([][]byte, count*N)
+	var min, max, acc time.Duration
+
+	for i := 0; i < count*N; i++ {
+		k, err := crypto.GenerateKey()
+		if err != nil {
+			panic(err)
+		}
+		keys[i] = crypto.FromECDSAPub(&k.PublicKey)
+	}
+
+	fmt.Printf("samples =")
+	for n := 0; n < N; n++ {
+
+		now := time.Now()
+		sorter(keys[count*n : count*(n+1)])
+		sample := time.Since(now)
+		fmt.Printf(" %v", sample)
+		if min == time.Duration(0) || sample < min {
+			min = sample
+		}
+		if sample > max {
+			max = sample
+		}
+		acc += sample
+	}
+
+	fmt.Printf("\nmin=%v, max=%v, mean=%v\n", min, max, acc/time.Duration(N))
+
+	// resort fully sorted data
+
+	fmt.Printf("samples =")
+	min, max, acc = time.Duration(0), time.Duration(0), time.Duration(0)
+	for n := 0; n < N; n++ {
+
+		now := time.Now()
+		sorter(keys[count*n : count*(n+1)])
+		sample := time.Since(now)
+		fmt.Printf(" %v", sample)
+		if min == time.Duration(0) || sample < min {
+			min = sample
+		}
+		if sample > max {
+			max = sample
+		}
+		acc += sample
+	}
+
+	fmt.Printf("\nmin=%v, max=%v, mean=%v\n", min, max, acc/time.Duration(N))
+
+	fmt.Printf("samples =")
+	min, max, acc = time.Duration(0), time.Duration(0), time.Duration(0)
+	min = time.Duration(0)
+	for n := 0; n < N; n++ {
+
+		now := time.Now()
+		sorter(keys[count*n : count*(n+1)])
+		sample := time.Since(now)
+		fmt.Printf(" %v", sample)
+		if min == time.Duration(0) || sample < min {
+			min = sample
+		}
+		if sample > max {
+			max = sample
+		}
+		acc += sample
+	}
+
+	fmt.Printf("\nmin=%v, max=%v, mean=%v\n", min, max, acc/time.Duration(N))
+
 }
 
 func TestDecodeGenesisActivity(t *testing.T) {
@@ -115,6 +208,11 @@ func NewActiveSelection(config *rrr.Config, codec *rrr.CipherCodec, logger rrr.L
 	return a
 }
 
+func NewActiveSelection3(config *rrr.Config, codec *rrr.CipherCodec, logger rrr.Logger) rrr.ActiveSelection {
+	a := rrr.NewActiveSelection3(config, codec, rrr.Hash{1, 2, 3}, logger)
+	return a
+}
+
 // TestAccumulateGenesisActivity tests that the order of enrolments
 // in the gensis block match the order produced by ActiveSelection from the
 // genesis block
@@ -123,30 +221,34 @@ func TestAccumulateGenesisActivity(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	numIdents := 12
+	for _, a := range []rrr.ActiveSelection{
+		NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(defaultConfig(), NewCodec(), NewLogger(nil)),
+	} {
 
-	net := newNetwork(t, numIdents)
-	ch := newChain(net.genesis)
+		numIdents := 12
 
-	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
+		net := newNetwork(t, numIdents)
+		ch := newChain(net.genesis)
 
-	a.Reset(net.genesis)
+		a.Reset(net.genesis)
 
-	err := a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
+		err := a.AccumulateActive(1, net.ge.ChainID, ch, ch.CurrentHeader())
 
-	require.NoError(err)
-	assert.Equal(a.NumActive(), numIdents, "missing active from selection")
+		require.NoError(err)
+		assert.Equal(a.NumActive(), numIdents, "missing active from selection")
 
-	// For the genesis block, the age ordering should exactly match the
-	// enrolment order. And the identity that signed the genesis block should be
-	// the youngest - as it is considered more recently active than any identity
-	// it enrols in the block it seals.
-	order := make([]int, numIdents)
-	for i := 0; i < numIdents; i++ {
-		order[numIdents-i-1] = i
+		// For the genesis block, the age ordering should exactly match the
+		// enrolment order. And the identity that signed the genesis block should be
+		// the youngest - as it is considered more recently active than any identity
+		// it enrols in the block it seals.
+		order := make([]int, numIdents)
+		for i := 0; i < numIdents; i++ {
+			order[i] = i
+		}
+
+		net.requireOrder(1, t, a, order)
 	}
-
-	net.requireOrder(t, a, order)
 }
 
 // TestFirstAccumulate tests the accumulation of activity from the first
@@ -156,23 +258,29 @@ func TestFirstAccumulate(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	net := newNetwork(t, 3)
-	ch := newChain(net.genesis)
-	ch.Extend(net, 0, 1, 2)
+	for _, a := range []rrr.ActiveSelection{
+		NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(defaultConfig(), NewCodec(), NewLogger(nil)),
+	} {
 
-	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
-	a.Reset(net.genesis)
+		net := newNetwork(t, 3)
+		ch := newChain(net.genesis)
+		ch.Extend(net, 0, 1, 2)
 
-	err := a.AccumulateActive(
-		net.ge.ChainID, ch, ch.CurrentHeader())
+		a.Reset(net.genesis)
 
-	require.NoError(err)
-	assert.Equal(a.NumActive(), 3, "missing active from selection")
+		err := a.AccumulateActive(
+			1, net.ge.ChainID, ch, ch.CurrentHeader())
 
-	// the youngest identity should be at the front and should be the id=0
-	id, ok := net.nodeID2id[a.YoungestNodeID()]
-	require.True(ok)
-	assert.Equal(id, 0)
+		require.NoError(err)
+		assert.Equal(a.NumActive(), 3, "missing active from selection")
+		ordered := a.NOldest(0, 3)
+
+		// the youngest identity should be at the front and should be the id=0
+		id, ok := net.nodeAddr2id[ordered[len(ordered)-1]]
+		require.True(ok)
+		assert.Equal(id, 0)
+	}
 
 }
 
@@ -185,35 +293,53 @@ func TestAccumulateTwice(t *testing.T) {
 
 	numIdents := 12
 
-	net := newNetwork(t, numIdents)
-	ch := newChain(net.genesis)
+	config := defaultConfig()
+	var permutation []int
+	for i := 0; i < int(config.Endorsers); i++ {
+		permutation = append(permutation, i)
+	}
 
-	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
-	a.Reset(net.genesis)
+	for _, a := range []rrr.ActiveSelection{
+		NewActiveSelection(config, NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(config, NewCodec(), NewLogger(nil)),
+	} {
+		net := newNetwork(t, numIdents)
+		ch := newChain(net.genesis)
 
-	// Establish the intial ordering from the genesis block.
-	err := a.AccumulateActive(
-		net.ge.ChainID, ch, ch.CurrentHeader())
-	require.NoError(err)
+		a.Reset(net.genesis)
 
-	net.requireOrder(t, a, []int{11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0})
+		// Establish the intial ordering from the genesis block.
+		err := a.AccumulateActive(
+			1, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
 
-	// Make 3 blocks. The first and the last will be sealed by the same identity.
+		net.requireOrder(1, t, a, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
 
-	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers.
-	// Imagining the rounds progress as expected, 2 should seal next
-	ch.Extend(net, 2, 3, 4, 5)
-	// Something very odd happened and 1 seals the next block (in reality this
-	// implies a lot of failed attempts and un reachable nodes). Lets make the
-	// endorsers the same too.
-	ch.Extend(net, 1, 2, 3, 4)
+		// Make 3 blocks. The first and the last will be sealed by the same identity.
 
-	err = a.AccumulateActive(
-		net.ge.ChainID, ch, ch.CurrentHeader())
-	require.NoError(err)
+		ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers.
+		// Imagining the rounds progress as expected, 2 should seal next
+		ch.Extend(net, 2, 3, 4, 5)
+		// Something very odd happened and 1 seals the next block (in reality this
+		// implies a lot of failed attempts and un reachable nodes). Lets make the
+		// endorsers the same too.
+		ch.Extend(net, 1, 2, 3, 4)
 
-	// Note: only the sealer id's should move
-	net.requireOrder(t, a, []int{1, 2, 11, 10, 9, 8, 7, 6, 5, 4, 3, 0})
+		err = a.AccumulateActive(
+			5, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
+
+		// allow for idle culling based on failed rounds book keeping accross both selectactive and accumualte active
+		_, _, err = a.SelectCandidatesAndEndorsers(5, permutation)
+		require.NoError(err)
+
+		err = a.AccumulateActive(
+			6, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
+
+		// Note: only the sealer id's should move. Also, 0 gets culled due to the idle leader rules
+		net.requireOrder(5, t, a, []int{4, 5, 6, 7, 8, 9, 10, 11, 2, 1})
+	}
 }
 
 // TestBranchDetection tests that AccumulateActive spots forks and returns a
@@ -225,32 +351,37 @@ func TestBranchDetection(t *testing.T) {
 	logger.SetHandler(log.StreamHandler(os.Stdout, log.TerminalFormat(false)))
 
 	numIdents := 12
+	config := defaultConfig()
 
-	net := newNetwork(t, numIdents)
-	ch := newChain(net.genesis)
+	for _, a := range []rrr.ActiveSelection{
+		NewActiveSelection(config, NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(config, NewCodec(), NewLogger(nil)),
+	} {
+		net := newNetwork(t, numIdents)
+		ch := newChain(net.genesis)
 
-	a := NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil))
-	a.Reset(net.genesis)
+		a.Reset(net.genesis)
 
-	// build a 4 block chain
-	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
-	ch.Extend(net, 2, 3, 4, 5)
-	ch.Extend(net, 3, 4, 5, 6)
-	ch.Extend(net, 4, 5, 6, 7)
+		// build a 4 block chain
+		ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
+		ch.Extend(net, 2, 3, 4, 5)
+		ch.Extend(net, 3, 4, 5, 6)
+		ch.Extend(net, 4, 5, 6, 7)
 
-	err := a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
-	require.NoError(err)
+		err := a.AccumulateActive(5, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
 
-	// Make a fork from block 2
-	intent := net.newIntent(5, ch.blocks[2])
-	confirm := net.endorseIntent(intent, 6, 7, 8)
-	forkFirst := net.sealBlock(5, intent, confirm, dummySeed)
-	ch.Add(forkFirst)
-	// Now CurrentBlock will return the forked block so we can use extend
-	ch.Extend(net, 6, 7, 8, 9)
+		// Make a fork from block 2
+		intent := net.newIntent(5, ch.blocks[2])
+		confirm := net.endorseIntent(intent, 6, 7, 8)
+		forkFirst := net.sealBlock(5, intent, confirm, dummySeed)
+		ch.Add(forkFirst)
+		// Now CurrentBlock will return the forked block so we can use extend
+		ch.Extend(net, 6, 7, 8, 9)
 
-	err = a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
-	require.True(errors.Is(err, rrr.ErrBranchDetected))
+		err = a.AccumulateActive(6, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.True(errors.Is(err, rrr.ErrBranchDetected))
+	}
 }
 
 // TestShortActivityHorizon tests that the age order of the active selection is
@@ -264,74 +395,86 @@ func TestBranchDetection(t *testing.T) {
 func TestShortActityHorizon(t *testing.T) {
 	require := require.New(t)
 
-	logger := NewLogger(nil)
-
 	numIdents := 12
-
-	net := newNetwork(t, numIdents)
-	ch := newChain(net.genesis)
-
-	codec := NewCodec()
 	config := defaultConfig()
 	config.Activity = 5
-	a := NewActiveSelection(config, codec, logger)
+	var permutation []int
+	for i := 0; i < int(config.Endorsers); i++ {
+		permutation = append(permutation, i)
+	}
 
-	a.Reset(net.genesis)
+	for _, a := range []rrr.ActiveSelection{
+		NewActiveSelection(config, NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(config, NewCodec(), NewLogger(nil)),
+	} {
+		net := newNetwork(t, numIdents)
+		ch := newChain(net.genesis)
 
-	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
-	ch.Extend(net, 2, 3, 4, 5)
-	ch.Extend(net, 3, 4, 5, 6)
-	ch.Extend(net, 4, 5, 6, 7)
+		a.Reset(net.genesis)
 
-	err := a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
-	require.NoError(err)
+		ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers
+		ch.Extend(net, 2, 3, 4, 5)
+		ch.Extend(net, 3, 4, 5, 6)
+		ch.Extend(net, 4, 5, 6, 7)
 
-	// We have exactly 5 blocks including the genesis. The genesis has activity
-	// for all 12 identities.
-	// order := []int{5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4}
-	order := []int{4, 3, 2, 1, 11, 10, 9, 8, 7, 6, 5, 0}
-	net.requireOrder(t, a, order)
+		err := a.AccumulateActive(5, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
 
-	// Add 7 more blocks
-	ch.Extend(net, 5, 6, 7, 8)
-	ch.Extend(net, 6, 7, 8, 9)
-	ch.Extend(net, 7, 8, 9, 10)
-	ch.Extend(net, 8, 9, 10, 11)
-	ch.Extend(net, 9, 10, 11, 0)
-	ch.Extend(net, 10, 11, 0, 1)
-	ch.Extend(net, 11, 0, 1, 2)
-	ch.Extend(net, 0, 1, 2, 3)
+		// We have exactly 5 blocks including the genesis. The genesis has activity
+		// for all 12 identities.
+		order := []int{0, 5, 6, 7, 8, 9, 10, 11, 1, 2, 3, 4}
+		net.requireOrder(5, t, a, order)
 
-	err = a.AccumulateActive(net.ge.ChainID, ch, ch.CurrentHeader())
-	require.NoError(err)
+		// Add 7 more blocks
+		ch.Extend(net, 5, 6, 7, 8)
+		ch.Extend(net, 6, 7, 8, 9)
+		ch.Extend(net, 7, 8, 9, 10)
+		ch.Extend(net, 8, 9, 10, 11)
+		ch.Extend(net, 9, 10, 11, 0)
+		ch.Extend(net, 10, 11, 0, 1)
+		ch.Extend(net, 11, 0, 1, 2)
+		ch.Extend(net, 0, 1, 2, 3)
 
-	// Now we expect the sealers of the most recent 5 to move, and everything
-	// else to stay as it was. selectCandidatesAndEndorsers *skips* items that
-	// are beyond the tActive horizon. When idles are fully implemented,
-	// skipping will involve moving to the idle pool.
+		err = a.AccumulateActive(14, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
 
-	order = []int{0, 11, 10, 9, 8, 4, 3, 2, 1} /* culled , 7, 6, 5 */
-	net.requireOrder(t, a, order)
+		// allow for idle culling based on failed rounds book keeping accross both selectactive and accumualte active
+		_, _, err = a.SelectCandidatesAndEndorsers(5, permutation)
+		require.NoError(err)
+
+		err = a.AccumulateActive(
+			6, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
+
+		// Now we expect the sealers of the most recent 5 to move, and everything
+		// else to stay as it was.
+
+		order = []int{1, 2, 3, 4, 8, 9, 10, 11, 0} /* culled , 7, 6, 5 */
+		net.requireOrder(14, t, a, order)
+	}
 }
 
-func (net *network) requireOrder(t *testing.T, a rrr.ActiveSelection, order []int) {
+func (net *network) requireOrder(roundNumber uint64, t *testing.T, a rrr.ActiveSelection, order []int) {
 
-	nok := 0
+	ordered := a.NOldest(roundNumber, len(order))
+	require.Equal(t, len(order), len(ordered))
 
-	for cur, icur := rrr.NewActiveSelectionCursor(a).Front(), 0; cur != nil; cur, icur = cur.Next(), icur+1 {
+	notOk := 0
+	for i := 0; i < len(order); i++ {
 
-		nodeID := cur.NodeID()
+		addr := ordered[i]
 
-		ok := order[icur] == net.nodeID2id[nodeID]
-		if ok {
-			nok++
+		ok := order[i] == net.nodeAddr2id[addr]
+		if !ok {
+			notOk++
 		}
 
 		net.logger.Info(
-			"activeItem", "ok", ok, "addr", nodeID.Address().HexShort(),
-			"order", order[icur], "id", net.nodeID2id[nodeID], "position", icur)
+			"activeItem", "ok", ok, "addr", addr.HexShort(),
+			"order", order[i], "addr", net.nodeAddr2id[addr], "position", i)
 	}
-	require.Equal(t, nok, len(order))
+
+	require.Zero(t, notOk)
 }
 
 // network represents a network of identities participating in RRR consensus
@@ -344,10 +487,11 @@ type network struct {
 	genesis rrr.BlockHeader
 
 	// For clarity of testing, work with integer indices as id's
-	id2key    map[int]*ecdsa.PrivateKey
-	id2NodeID map[int]rrr.Hash
-	nodeID2id map[rrr.Hash]int
-	keys      []*ecdsa.PrivateKey
+	id2key      map[int]*ecdsa.PrivateKey
+	id2NodeID   map[int]rrr.Hash
+	nodeID2id   map[rrr.Hash]int
+	nodeAddr2id map[rrr.Address]int
+	keys        []*ecdsa.PrivateKey
 }
 
 type chain struct {
@@ -397,12 +541,13 @@ func newNetwork(t *testing.T, numIdents int) *network {
 	codec := NewCodec()
 
 	net := &network{
-		t:         t,
-		logger:    NewLogger(nil),
-		keys:      requireGenerateKeys(t, numIdents),
-		id2key:    make(map[int]*ecdsa.PrivateKey),
-		id2NodeID: make(map[int]rrr.Hash),
-		nodeID2id: make(map[rrr.Hash]int),
+		t:           t,
+		logger:      NewLogger(nil),
+		keys:        requireGenerateKeys(t, numIdents),
+		id2key:      make(map[int]*ecdsa.PrivateKey),
+		id2NodeID:   make(map[int]rrr.Hash),
+		nodeID2id:   make(map[rrr.Hash]int),
+		nodeAddr2id: make(map[rrr.Address]int),
 	}
 
 	identities := identitiesFromKeys(net.keys...)
@@ -410,6 +555,7 @@ func newNetwork(t *testing.T, numIdents int) *network {
 		net.id2key[id] = key
 		net.id2NodeID[id] = rrr.NodeIDFromPub(c, &key.PublicKey)
 		net.nodeID2id[net.id2NodeID[id]] = id
+		net.nodeAddr2id[net.id2NodeID[id].Address()] = id
 	}
 
 	net.ge = requireMakeGenesisExtra(t,
