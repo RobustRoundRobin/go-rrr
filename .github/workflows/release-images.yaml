@@ -7,7 +7,7 @@ env:
   # you need to finalise the release before ultimately doing the v0.2.0. If
   # that final release fails for an intermitent reason that requires a fixup,
   # force retag the fixup or start again with a new tag
-  QUORUM_RRR_VERSION: ${{ GITHUB_REF }}
+  QUORUM_RRR_VERSION: ${{ .GITHUB_REF }}
 on:
   workflow_dispatch: []
   release:
