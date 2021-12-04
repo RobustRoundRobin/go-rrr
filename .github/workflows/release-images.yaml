@@ -21,7 +21,7 @@ jobs:
           # you need to finalise the release before ultimately doing the v0.2.0. If
           # that final release fails for an intermitent reason that requires a fixup,
           # force retag the fixup or start again with a new tag
-          echo "QUORUM_RRR_VERSION=$(echo ${QUORUM_RRR_VERSION%-*}" >> $GITHUB_ENV
+          echo "QUORUM_RRR_VERSION=${QUORUM_RRR_VERSION%-*}" >> $GITHUB_ENV
           echo QUORUM_RRR_VERSION=$QUORUM_RRR_VERSION
 
       -
