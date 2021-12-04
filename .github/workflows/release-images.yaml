@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v2
         with:
           repository: RobustRoundRobin/quorum
-          ref: "${{ env.QUORUM_VERSION }}-rrr${{ env.RRR_VERSION }}"
+          ref: "${{ env.QUORUM_VERSION }}-rrr_${{ env.RRR_VERSION }}"
           path: quorum
           token: ${{ github.token }}
       -
