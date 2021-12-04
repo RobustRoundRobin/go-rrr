@@ -2,13 +2,7 @@ name: "smoketest (rrr, raft and ibft consensus in forked go-quorum)"
 on:
   workflow_dispatch:
     inputs:
-      numnodes:
-        description: 'number of nodes required in the network'
-        type: string
-        default: "3"
-      profile:
-        description: 'name of a benchblock profile ({consensus}-k8s-{profile}.json in benchblock/configs). defaults to numnodes'
-        type: string
+
       namespaceprefix:
         description: 'prefix to the namespace for all workloads'
         type: string
@@ -32,8 +26,7 @@ jobs:
       location: "europe-west2-a"
       cluster_name: "kluster"
       consensus: raft
-      numnodes: ${{ github.event.inputs.numnodes }}
-      profile: ${{ github.event.inputs.profile }}
+      numnodes: 3
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
       maxwait: ${{ github.event.inputs.maxwait }}
 
@@ -47,7 +40,7 @@ jobs:
       location: "europe-west2-a"
       cluster_name: "kluster"
       consensus: "ibft"
-      numnodes: ${{ github.event.inputs.numnodes }}
+      numnodes: 5
       profile: ${{ github.event.inputs.profile }}
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
       maxwait: ${{ github.event.inputs.maxwait }}
@@ -62,7 +55,7 @@ jobs:
       location: "europe-west2-a"
       cluster_name: "kluster"
       consensus: "rrr"
-      numnodes: ${{ github.event.inputs.numnodes }}
+      numnodes: 9
       profile: ${{ github.event.inputs.profile }}
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
       maxwait: ${{ github.event.inputs.maxwait }}
