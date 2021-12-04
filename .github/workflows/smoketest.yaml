@@ -28,7 +28,7 @@ jobs:
       consensus: raft
       numnodes: 3
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
-      maxwait: ${{ github.event.inputs.maxwait }}
+      maxwait: ${{ inputs.maxwait }}
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
@@ -43,7 +43,7 @@ jobs:
       numnodes: 5
       profile: ${{ github.event.inputs.profile }}
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
-      maxwait: ${{ github.event.inputs.maxwait }}
+      maxwait: ${{ inputs.maxwait }}
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
@@ -58,7 +58,7 @@ jobs:
       numnodes: 9
       profile: ${{ github.event.inputs.profile }}
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
-      maxwait: ${{ github.event.inputs.maxwait }}
+      maxwait: ${{ inputs.maxwait }}
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
