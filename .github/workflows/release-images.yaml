@@ -81,7 +81,6 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}sha-
 
       -
         name: Build and push rrrctl
