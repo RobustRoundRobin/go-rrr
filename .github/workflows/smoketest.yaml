@@ -33,6 +33,7 @@ jobs:
       cluster_name: "kluster"
       consensus: raft
       numnodes: ${{ github.event.inputs.namenodes }}
+      profile: ${{ github.event.inputs.profile }}
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
       maxwait: ${{ github.event.inputs.maxwait }}
 
@@ -47,6 +48,7 @@ jobs:
       cluster_name: "kluster"
       consensus: "ibft"
       numnodes: ${{ github.event.inputs.namenodes }}
+      profile: ${{ github.event.inputs.profile }}
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
       maxwait: ${{ github.event.inputs.maxwait }}
 
@@ -61,6 +63,7 @@ jobs:
       cluster_name: "kluster"
       consensus: "rrr"
       numnodes: ${{ github.event.inputs.namenodes }}
+      profile: ${{ github.event.inputs.profile }}
       namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
       maxwait: ${{ github.event.inputs.maxwait }}
 
