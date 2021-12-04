@@ -1,20 +1,10 @@
 name: "smoketest (rrr, raft and ibft consensus in forked go-quorum)"
+env:
+  MAXWAIT: "360"
+  NAMESPACEPREFIX: "go-rrr-smoketest-"
+
 on:
   workflow_dispatch:
-    inputs:
-
-      namespaceprefix:
-        description: 'prefix to the namespace for all workloads'
-        type: string
-        default: "go-rrr-smoketest-"
-
-      maxwait:
-        description: >
-          maximum number of seconds (total) to wait for any intermediate result, eg deployment or
-          loadtesting
-        type: string
-        default: "360"
-
   release:
     types: [published, prerelease]
 
@@ -27,8 +17,8 @@ jobs:
       cluster_name: "kluster"
       consensus: raft
       numnodes: 3
-      namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
-      maxwait: ${{ inputs.maxwait }}
+      namespaceprefix: ${{ env.NAMESPACEPREFIX }}
+      maxwait: ${{ env.MAXWAIT }}
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
@@ -42,8 +32,8 @@ jobs:
       consensus: "ibft"
       numnodes: 5
       profile: ${{ github.event.inputs.profile }}
-      namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
-      maxwait: ${{ inputs.maxwait }}
+      namespaceprefix: ${{ env.NAMESPACEPREFIX }}
+      maxwait: ${{ env.MAXWAIT }}
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
@@ -57,8 +47,8 @@ jobs:
       consensus: "rrr"
       numnodes: 9
       profile: ${{ github.event.inputs.profile }}
-      namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
-      maxwait: ${{ inputs.maxwait }}
+      namespaceprefix: ${{ env.NAMESPACEPREFIX }}
+      maxwait: ${{ env.MAXWAIT }}
 
     secrets:
       gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
