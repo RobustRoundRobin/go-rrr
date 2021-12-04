@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-and-release-images:
-    name: Build and publish geth-rrr image
+    name: Build and release geth-rrr image
     runs-on: ubuntu-latest
     steps:
 
@@ -21,7 +21,7 @@ jobs:
           # you need to finalise the release before ultimately doing the v0.2.0. If
           # that final release fails for an intermitent reason that requires a fixup,
           # force retag the fixup or start again with a new tag
-          echo "QUORUM_RRR_VERSION=${GITHUB_REF%-*}" >> $GITHUB_ENV
+          echo "QUORUM_RRR_VERSION=${GITHUB_REF_NAME%-*}" >> $GITHUB_ENV
           echo QUORUM_RRR_VERSION=$QUORUM_RRR_VERSION
 
       -
