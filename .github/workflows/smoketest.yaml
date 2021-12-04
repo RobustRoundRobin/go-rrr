@@ -1,0 +1,68 @@
+name: "smoketest (rrr, raft and ibft consensus in forked go-quorum)"
+on:
+  workflow_dispatch:
+    inputs:
+      numnodes:
+        description: 'number of nodes required in the network'
+        type: string
+        default: "3"
+      profile:
+        description: 'name of a benchblock profile ({consensus}-k8s-{profile}.json in benchblock/configs). defaults to numnodes'
+        type: string
+      namespaceprefix:
+        description: 'prefix to the namespace for all workloads'
+        type: string
+        default: "go-rrr-smoketest-"
+
+      maxwait:
+        description: >
+          maximum number of seconds (total) to wait for any intermediate result, eg deployment or
+          loadtesting
+        type: string
+        default: "360"
+
+  release:
+    types: [published, prerelease]
+
+jobs:
+  raft:
+    uses: robinbryce/benchblock/.github/workflows/loadtest-on-gcp.yaml@main
+    with:
+      project_id: "fetlar-1"
+      location: "europe-west2-a"
+      cluster_name: "kluster"
+      consensus: raft
+      numnodes: ${{ github.event.inputs.namenodes }}
+      namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
+      maxwait: ${{ github.event.inputs.maxwait }}
+
+    secrets:
+      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
+
+  ibft:
+    uses: robinbryce/benchblock/.github/workflows/loadtest-on-gcp.yaml@main
+    with:
+      project_id: "fetlar-1"
+      location: "europe-west2-a"
+      cluster_name: "kluster"
+      consensus: "ibft"
+      numnodes: ${{ github.event.inputs.namenodes }}
+      namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
+      maxwait: ${{ github.event.inputs.maxwait }}
+
+    secrets:
+      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
+
+  rrr:
+    uses: robinbryce/benchblock/.github/workflows/loadtest-on-gcp.yaml@main
+    with:
+      project_id: "fetlar-1"
+      location: "europe-west2-a"
+      cluster_name: "kluster"
+      consensus: "rrr"
+      numnodes: ${{ github.event.inputs.namenodes }}
+      namespaceprefix: ${{ github.event.inputs.namespaceprefix }}
+      maxwait: ${{ github.event.inputs.maxwait }}
+
+    secrets:
+      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
