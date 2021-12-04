@@ -2,8 +2,12 @@ name: Build and release geth-rrr image -x
 env:
   DOCKERHUB_USERNAME: robinbryce
   QUORUM_VERSION: v21.10.0
-  # RRR_VERSION: ${{ .GITHUB_REF }}
-  RRR_VERSION: v0.1.0
+  # The quorum fork repo should be tagged before releasing go-rrr with the
+  # expected final release tag. Eg v0.2.0. Then do as many v0.2.0-aN tags as
+  # you need to finalise the release before ultimately doing the v0.2.0. If
+  # that final release fails for an intermitent reason that requires a fixup,
+  # force retag the fixup or start again with a new tag
+  QUORUM_RRR_VERSION: ${{ .GITHUB_REF }}
 on:
   workflow_dispatch: []
   release:
@@ -14,6 +18,12 @@ jobs:
     name: Build and publish geth-rrr image
     runs-on: ubuntu-latest
     steps:
+
+      -
+        name: finalise env
+        run: |
+          echo "QUORUM_RRR_VERSION=$(echo ${QUORUM_RRR_VERSION%-*}" >> $GITHUB_ENV
+          echo QUORUM_RRR_VERSION=$QUORUM_RRR_VERSION
 
       -
         name: checkout go-rrr
@@ -27,7 +37,7 @@ jobs:
         uses: actions/checkout@v2
         with:
           repository: RobustRoundRobin/quorum
-          ref: "${{ env.QUORUM_VERSION }}-rrr_${{ env.RRR_VERSION }}"
+          ref: "${{ env.QUORUM_VERSION }}-rrr_${{ env.QUORUM_RRR_VERSION }}"
           path: quorum
           token: ${{ github.token }}
       -
