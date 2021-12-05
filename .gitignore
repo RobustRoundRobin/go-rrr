@@ -1,1 +1,7 @@
 .DS_Store
+*.egg-info
+*.code-workspace
+__debug_bin
+__pycache__
+dist
+build
