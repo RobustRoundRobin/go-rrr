@@ -21,6 +21,7 @@ type activity struct {
 	lastBlockSeen    Hash
 	activeBlockFence uint64
 	logger           Logger
+	rotateCandidates bool
 }
 
 func NewActiveSelection3(
@@ -35,7 +36,10 @@ func NewActiveSelection3(
 	if a.config.Candidates > a.config.MinIdleAttempts {
 		a.idleRoundLimit = a.config.Candidates
 	}
-	logger.Debug("RRR NewActiveSelection3", "idleRoundLimit", a.idleRoundLimit)
+	if config.ActivityMethod == RRRActiveMethodRotateCandidates {
+		a.rotateCandidates = true
+	}
+	logger.Debug("RRR NewActiveSelection3", "rotatecandidates", a.rotateCandidates, "idleRoundLimit", a.idleRoundLimit)
 
 	return a
 }
@@ -259,30 +263,12 @@ func (a *activity) SelectCandidatesAndEndorsers(
 	candidates := make(map[Address]bool)
 	endorsers := make(map[Address]bool)
 
-	for i, p := range a.aged {
-
-		if i >= Nc {
-			break
-		}
-
-		// if we don't have at least Nc+Ne endorsers don't apply the idles rule.
-		if len(a.active) <= (int(a.config.Candidates) + int(a.config.Endorsers)) {
-			candidates[p.nodeID.Address()] = true
-			continue
-		}
-
-		// oldestFor idle rule
-		if !p.oldestForIdleRule(i, roundNumber, a.idleRoundLimit) {
-			candidates[p.nodeID.Address()] = true
-			continue
-		}
-
-		delete(a.active, p.nodeID.Address())
-		a.logger.Debug(
-			"RRR selectCandEs - dropped idle leader",
-			"cand", fmt.Sprintf("%s:%05d.%02d", p.nodeID.Address().Hex(), p.ageBlock, p.genesisOrder),
-			"r", roundNumber, "ar", p.ageBlock,
-		)
+	candidateSelector := a.selectCandidatesWithOldestForRule
+	if a.rotateCandidates {
+		candidateSelector = a.selectCandidatesWithRotation
+	}
+	if err := candidateSelector(roundNumber, candidates); err != nil {
+		return nil, nil, err
 	}
 
 	byid := a.sortedByIdExcluding(candidates)
@@ -305,6 +291,144 @@ func (a *activity) SelectCandidatesAndEndorsers(
 	}
 
 	return candidates, endorsers, nil
+}
+
+// selectCandidatesWithRotation ensures liveness by rotating the leader
+// selection through the age ordered identities. The advantage of this method is
+// that it does not require a block to arrive in order to re-enrole leader
+// candidates we culled due to inactivity - which is a common occurence in
+// networks during startup and if they have been quiesed and restarted. However,
+// using this method a byzantine candidate may choose not to mint indefinitely
+// as its position in the aged order will not change until it mints or endorses.
+// When one of the fair candidates mines, the failed attempts reset so the
+// byzantine candidate will be the 'oldest selcted' again. But once it mints (or
+// endorses) it will be last (youngest) in the order again. The byzantine node
+// still only gets to mine once, but using this method it can delay the use of
+// its 'slot' arbitrarily.
+func (a *activity) selectCandidatesWithRotation(roundNumber uint64, candidates map[Address]bool) error {
+
+	Nc := int(a.config.Candidates)
+	// The round that most recently produced a block is recoded as the ageRound on the 'yougest' known participant.
+	lastSuccessfulRound := a.aged[len(a.aged)-1].ageRound
+	if roundNumber < lastSuccessfulRound {
+		return fmt.Errorf(
+			"round number %v invalid, can't be lower that last successful round:%v", roundNumber, lastSuccessfulRound)
+	}
+
+	failedAttempts := int(0)
+	if roundNumber > lastSuccessfulRound {
+		failedAttempts = int(roundNumber-lastSuccessfulRound) - 1
+	}
+
+	firstCandidate, overrun := candidateRange(roundNumber, failedAttempts, Nc, len(a.aged))
+
+	// If we have an overrun, we collect them first. otherwise this loop doesn't execute
+	for i := 0; i < overrun; i++ {
+		p := a.aged[i]
+		p.candidateRound = roundNumber
+		candidates[p.nodeID.Address()] = true
+	}
+
+	// As long as failedAttempts is < len(aged) + nc, this loop collects all the candidates in a single shot.
+	for i := firstCandidate; i < firstCandidate+Nc-overrun; i++ {
+		p := a.aged[i]
+		p.candidateRound = roundNumber
+		candidates[p.nodeID.Address()] = true
+	}
+	return nil
+}
+
+// candidateRange returns the index of the first leader candidate and the
+// overrun if the candidate selection straddles the end of the age order
+// Rotating the candidte window by failedAttempts requires us to deal with
+// two cases. The first is straight forward, we just offset the start. The
+// second requires more care as it splits the candidate selection over the
+// start and end of the aged sequence.
+func candidateRange(roundNumber uint64, failedAttempts, nc, na int) (int, int) {
+
+	// a) |<- failedAttempts % len(aged) ->| c0, ..., cN | .... |
+	// b) | ... cN | failedAttempts % len(aged) --> | c0 ...    |
+	// overrun --^
+	//
+	// nc = 3, len(aged) = na == 6
+	// b) fa = 4
+	//    fc = (fa % na) = firstCandidate = fc
+	//    fc+nc-na = overrun | if fc+nc-na > 0 and 0 otherwise
+	//    4 % 6 = 4 = fc
+	//    4+3-6     = 1
+	//    | cN | .... |c0 <- fc  + nc - overrun -> |
+	//      0    1 2 3 4         5
+	//    fc ----------^
+	//    [0 1)  [4 4+3-1) = [4 6)
+	//
+	// b) fa = 5
+	//    (5 % 6) = 5 = fc
+	//    5+3-6   = 2 = overrun
+	//    | ci cN | .... |c0 <- fc  + nc - overrun -> |
+	//      0   1  2 3 4  5
+	//    fc -------------^
+	//    [0 2)  [5 fc+nc-overrun) = [5 6)
+	//    [0 2)  [5 5+3-2) = [5 6)
+	//
+	// a, b) fa = 2
+	//    (2 % 6) = 2 = fc
+	//    2+3-6   = -1 so overrun = 0
+	//    | .. |c0 cN | |
+	//      0 1 2 3 4  5
+	//    fc ---^
+	//    [2 fc+nc-0) = [2 2+3-0) = [2 5)
+	//
+	// a, b) fa = 0 or multiple of len(aged)
+	//    (0 % 6) = 0 = fc
+	//    (0 + 3 - 6) = -3 so overrun = 0
+	//    | ci .. cN | .... |
+	//      0   1  2  3 4  5
+	//    fc^
+	//    [0 2)  [5 5+3-2) = [5 6)
+
+	firstCandidate := failedAttempts % na
+	overrun := firstCandidate + nc - na
+	// if failedAttempts % len(aged) == 0 OR failedAttempts + Nc < len(aged) we
+	// get -ve here, and positive otherwise.
+	if overrun < 0 {
+		overrun = 0
+	}
+	return firstCandidate, overrun
+}
+
+// selectCandidatesWithRotation ensures liveness by rotating the leader
+// selection through the age ordered identities. Using this method a node is the
+// oldest candidate for a single round only, but remains in the candidate
+// selection for nc rounds.
+
+func (a *activity) selectCandidatesWithOldestForRule(roundNumber uint64, candidates map[Address]bool) error {
+
+	Nc := int(a.config.Candidates)
+
+	for i := 0; i < len(a.aged) && i < Nc; i++ {
+
+		p := a.aged[i]
+
+		// if we don't have at least Nc+Ne endorsers don't apply the idles rule.
+		if len(a.active) <= (int(a.config.Candidates) + int(a.config.Endorsers)) {
+			candidates[p.nodeID.Address()] = true
+			continue
+		}
+
+		// oldestFor idle rule
+		if !p.oldestForIdleRule(i, roundNumber, a.idleRoundLimit) {
+			candidates[p.nodeID.Address()] = true
+			continue
+		}
+
+		delete(a.active, p.nodeID.Address())
+		a.logger.Debug(
+			"RRR selectCandEs - dropped idle leader",
+			"cand", fmt.Sprintf("%s:%05d.%02d", p.nodeID.Address().Hex(), p.ageBlock, p.genesisOrder),
+			"r", roundNumber, "ar", p.ageBlock,
+		)
+	}
+	return nil
 }
 
 func (a *activity) Reset(head BlockHeader) {

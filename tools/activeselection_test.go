@@ -41,12 +41,14 @@ func makeTimeStamp(t *testing.T, sec int64, nsec int64) []byte {
 	return b
 }
 
-func defaultConfig() *rrr.Config {
+func defaultConfig(method string) *rrr.Config {
 	return &rrr.Config{
-		Activity:   10,
-		Candidates: 2,
-		Endorsers:  8,
-		Quorum:     5,
+		Activity:        12,
+		Candidates:      2,
+		Endorsers:       8,
+		Quorum:          5,
+		ActivityMethod:  method,
+		MinIdleAttempts: 5,
 	}
 }
 
@@ -222,8 +224,8 @@ func TestAccumulateGenesisActivity(t *testing.T) {
 	assert := assert.New(t)
 
 	for _, a := range []rrr.ActiveSelection{
-		NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil)),
-		NewActiveSelection3(defaultConfig(), NewCodec(), NewLogger(nil)),
+		NewActiveSelection(defaultConfig(rrr.RRRActiveMethodSampleAged), NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(defaultConfig(rrr.RRRActiveMethodSortEndorsers), NewCodec(), NewLogger(nil)),
 	} {
 
 		numIdents := 12
@@ -259,8 +261,8 @@ func TestFirstAccumulate(t *testing.T) {
 	assert := assert.New(t)
 
 	for _, a := range []rrr.ActiveSelection{
-		NewActiveSelection(defaultConfig(), NewCodec(), NewLogger(nil)),
-		NewActiveSelection3(defaultConfig(), NewCodec(), NewLogger(nil)),
+		NewActiveSelection(defaultConfig(rrr.RRRActiveMethodSampleAged), NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(defaultConfig(rrr.RRRActiveMethodSortEndorsers), NewCodec(), NewLogger(nil)),
 	} {
 
 		net := newNetwork(t, 3)
@@ -284,6 +286,79 @@ func TestFirstAccumulate(t *testing.T) {
 
 }
 
+// TestAccumulateWhenYoungestKnownIsAlsoMiner covers a corner case in the
+// implementation that maintains the identities in age sorted order. In this
+// case the fence used for the insert position moves because it is one of the
+// identities that mines a block.
+func TestAccumulateWhenYoungestKnownIsAlsoMiner(t *testing.T) {
+	require := require.New(t)
+
+	numIdents := 12
+
+	config := defaultConfig(rrr.DefaultConfig.ActivityMethod)
+	idleRoundLimit := config.MinIdleAttempts
+	if config.Candidates > idleRoundLimit {
+		idleRoundLimit = config.Candidates
+	}
+
+	require.Greater(idleRoundLimit, uint64(4))
+
+	var permutation []int
+	for i := 0; i < int(config.Endorsers); i++ {
+		permutation = append(permutation, i)
+	}
+
+	a := NewActiveSelection(defaultConfig(rrr.RRRActiveMethodSampleAged), NewCodec(), NewLogger(nil))
+
+	net := newNetwork(t, numIdents)
+	ch := newChain(net.genesis)
+
+	a.Reset(net.genesis)
+
+	// Establish the intial ordering from the genesis block.
+	err := a.AccumulateActive(
+		0, net.ge.ChainID, ch, ch.CurrentHeader())
+	require.NoError(err)
+
+	net.requireOrder(0, t, a, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
+	require.NoError(err)
+
+	// Make 3 blocks. The first and the last will be sealed by the same identity.
+
+	ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers. Note 1 becomes fence
+
+	// run a normal first round (so that parcipant candidateRound gets initialised)
+	// 1 mines (becoming oldes)
+	err = a.AccumulateActive(
+		1, net.ge.ChainID, ch, ch.CurrentHeader())
+	require.NoError(err)
+	_, _, err = a.SelectCandidatesAndEndorsers(1, permutation)
+	require.NoError(err)
+
+	// Imagining the rounds progress as expected, 2 should seal next. 1 becomes second oldest
+	ch.Extend(net, 2, 3, 4, 5)
+	// Something very odd happened and 1 seals the next block (in reality this
+	// implies a lot of failed attempts and un reachable nodes). Lets make the
+	// endorsers the same too. 1 becomes oldest again even though it is the
+	// fence
+	ch.Extend(net, 1, 5, 3, 4)
+
+	err = a.AccumulateActive(
+		idleRoundLimit+1, net.ge.ChainID, ch, ch.CurrentHeader())
+	require.NoError(err)
+
+	// allow for idle culling based on failed rounds book keeping accross both selectactive and accumualte active
+	_, _, err = a.SelectCandidatesAndEndorsers(idleRoundLimit+1, permutation)
+	require.NoError(err)
+
+	err = a.AccumulateActive(
+		idleRoundLimit+1, net.ge.ChainID, ch, ch.CurrentHeader())
+	require.NoError(err)
+
+	// Note: only the sealer id's should move. Also, 0 gets culled due to the idle leader rules
+	net.requireOrder(idleRoundLimit+1, t, a, []int{3, 4, 5, 6, 7, 8, 9, 10, 11, 2, 1})
+}
+
 // TestAccumulateTwice tests that the order is stable (and correct) if the same
 // identity is encountered twice. The first encounter of the identity in an
 // accumulation determines its age. Any subsequent enconter should not change
@@ -293,16 +368,31 @@ func TestAccumulateTwice(t *testing.T) {
 
 	numIdents := 12
 
-	config := defaultConfig()
+	config := defaultConfig(rrr.DefaultConfig.ActivityMethod)
+	idleRoundLimit := config.MinIdleAttempts
+	if config.Candidates > idleRoundLimit {
+		idleRoundLimit = config.Candidates
+	}
+
+	require.Greater(idleRoundLimit, uint64(4))
+
 	var permutation []int
 	for i := 0; i < int(config.Endorsers); i++ {
 		permutation = append(permutation, i)
 	}
 
-	for _, a := range []rrr.ActiveSelection{
-		NewActiveSelection(config, NewCodec(), NewLogger(nil)),
-		NewActiveSelection3(config, NewCodec(), NewLogger(nil)),
+	configs := []rrr.Config{
+		*defaultConfig(rrr.RRRActiveMethodSampleAged),
+		*defaultConfig(rrr.RRRActiveMethodRotateCandidates),
+		*defaultConfig(rrr.RRRActiveMethodSortEndorsers),
+	}
+
+	for i, a := range []rrr.ActiveSelection{
+		NewActiveSelection(&configs[0], NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(&configs[1], NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(&configs[2], NewCodec(), NewLogger(nil)),
 	} {
+
 		net := newNetwork(t, numIdents)
 		ch := newChain(net.genesis)
 
@@ -310,35 +400,51 @@ func TestAccumulateTwice(t *testing.T) {
 
 		// Establish the intial ordering from the genesis block.
 		err := a.AccumulateActive(
-			1, net.ge.ChainID, ch, ch.CurrentHeader())
+			0, net.ge.ChainID, ch, ch.CurrentHeader())
 		require.NoError(err)
 
-		net.requireOrder(1, t, a, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
+		net.requireOrder(0, t, a, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
+		require.NoError(err)
 
 		// Make 3 blocks. The first and the last will be sealed by the same identity.
 
 		ch.Extend(net, 1, 2, 3, 4) // sealer, ...endorsers.
-		// Imagining the rounds progress as expected, 2 should seal next
+
+		// run a normal first round (so that parcipant candidateRound gets initialised)
+		// 1 mines (becoming oldes)
+		err = a.AccumulateActive(
+			1, net.ge.ChainID, ch, ch.CurrentHeader())
+		require.NoError(err)
+		_, _, err = a.SelectCandidatesAndEndorsers(1, permutation)
+		require.NoError(err)
+
+		// Imagining the rounds progress as expected, 2 should seal next. 1 becomes second oldest
 		ch.Extend(net, 2, 3, 4, 5)
 		// Something very odd happened and 1 seals the next block (in reality this
 		// implies a lot of failed attempts and un reachable nodes). Lets make the
-		// endorsers the same too.
-		ch.Extend(net, 1, 2, 3, 4)
+		// endorsers the same too. 1 becomes oldest again
+		ch.Extend(net, 1, 5, 3, 4)
 
 		err = a.AccumulateActive(
-			5, net.ge.ChainID, ch, ch.CurrentHeader())
+			idleRoundLimit+1, net.ge.ChainID, ch, ch.CurrentHeader())
 		require.NoError(err)
 
 		// allow for idle culling based on failed rounds book keeping accross both selectactive and accumualte active
-		_, _, err = a.SelectCandidatesAndEndorsers(5, permutation)
+		_, _, err = a.SelectCandidatesAndEndorsers(idleRoundLimit+1, permutation)
 		require.NoError(err)
 
 		err = a.AccumulateActive(
-			6, net.ge.ChainID, ch, ch.CurrentHeader())
+			idleRoundLimit+1, net.ge.ChainID, ch, ch.CurrentHeader())
 		require.NoError(err)
 
 		// Note: only the sealer id's should move. Also, 0 gets culled due to the idle leader rules
-		net.requireOrder(5, t, a, []int{4, 5, 6, 7, 8, 9, 10, 11, 2, 1})
+		if configs[i].ActivityMethod != rrr.RRRActiveMethodRotateCandidates {
+			net.requireOrder(idleRoundLimit+1, t, a, []int{3, 4, 5, 6, 7, 8, 9, 10, 11, 2, 1})
+		} else {
+			// we don't remove leaders for missing their round, we rotate the
+			// candidate window through the whole active selection
+			net.requireOrder(idleRoundLimit+1, t, a, []int{0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 2, 1})
+		}
 	}
 }
 
@@ -351,11 +457,9 @@ func TestBranchDetection(t *testing.T) {
 	logger.SetHandler(log.StreamHandler(os.Stdout, log.TerminalFormat(false)))
 
 	numIdents := 12
-	config := defaultConfig()
-
 	for _, a := range []rrr.ActiveSelection{
-		NewActiveSelection(config, NewCodec(), NewLogger(nil)),
-		NewActiveSelection3(config, NewCodec(), NewLogger(nil)),
+		NewActiveSelection(defaultConfig(rrr.RRRActiveMethodSampleAged), NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(defaultConfig(rrr.RRRActiveMethodSortEndorsers), NewCodec(), NewLogger(nil)),
 	} {
 		net := newNetwork(t, numIdents)
 		ch := newChain(net.genesis)
@@ -396,16 +500,18 @@ func TestShortActityHorizon(t *testing.T) {
 	require := require.New(t)
 
 	numIdents := 12
-	config := defaultConfig()
-	config.Activity = 5
+
+	configs := []rrr.Config{*defaultConfig(rrr.RRRActiveMethodSampleAged), *defaultConfig(rrr.RRRActiveMethodSortEndorsers)}
+	configs[0].Activity = 5
+	configs[1].Activity = 5
 	var permutation []int
-	for i := 0; i < int(config.Endorsers); i++ {
+	for i := 0; i < int(configs[0].Endorsers); i++ {
 		permutation = append(permutation, i)
 	}
 
 	for _, a := range []rrr.ActiveSelection{
-		NewActiveSelection(config, NewCodec(), NewLogger(nil)),
-		NewActiveSelection3(config, NewCodec(), NewLogger(nil)),
+		NewActiveSelection(&configs[0], NewCodec(), NewLogger(nil)),
+		NewActiveSelection3(&configs[1], NewCodec(), NewLogger(nil)),
 	} {
 		net := newNetwork(t, numIdents)
 		ch := newChain(net.genesis)
@@ -456,13 +562,18 @@ func TestShortActityHorizon(t *testing.T) {
 
 func (net *network) requireOrder(roundNumber uint64, t *testing.T, a rrr.ActiveSelection, order []int) {
 
-	ordered := a.NOldest(roundNumber, len(order))
-	require.Equal(t, len(order), len(ordered))
+	ordered := a.NOldest(roundNumber, len(net.nodeAddr2id))
+	var actual []int
 
 	notOk := 0
-	for i := 0; i < len(order); i++ {
+	for i := 0; i < len(ordered); i++ {
 
 		addr := ordered[i]
+		actual = append(actual, net.nodeAddr2id[addr])
+
+		if i >= len(order) {
+			break
+		}
 
 		ok := order[i] == net.nodeAddr2id[addr]
 		if !ok {
@@ -473,7 +584,7 @@ func (net *network) requireOrder(roundNumber uint64, t *testing.T, a rrr.ActiveS
 			"activeItem", "ok", ok, "addr", addr.HexShort(),
 			"order", order[i], "addr", net.nodeAddr2id[addr], "position", i)
 	}
-
+	net.logger.Info("actual", "", actual)
 	require.Zero(t, notOk)
 }
 

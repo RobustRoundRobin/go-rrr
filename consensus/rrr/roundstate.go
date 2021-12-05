@@ -341,10 +341,12 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 	}
 
 	switch r.config.ActivityMethod {
-	case RRRActiveMethodSortEndorsers:
-		r.a = NewActiveSelection3(r.config, r.codec, r.nodeID, r.logger)
 	case RRRActiveMethodSampleAged:
 		r.a = NewActiveSelection(r.config, r.codec, r.nodeID, r.logger)
+	case RRRActiveMethodRotateCandidates:
+		fallthrough
+	case RRRActiveMethodSortEndorsers:
+		r.a = NewActiveSelection3(r.config, r.codec, r.nodeID, r.logger)
 	}
 
 	header := chain.CurrentHeader()

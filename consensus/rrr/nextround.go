@@ -457,7 +457,7 @@ func (r *EndorsmentProtocol) selectCandidatesAndEndorsers(
 	r.logger.Debug(
 		"RRR ACTIVE SAMPLE >>>>>>>>>",
 		"s", r.activeSample, "ns", r.selectionRand.NumSamplesRead(),
-		"r", r.Number, "bn", r.chainHead.GetNumber(), "#head", Hash(r.chainHead.Hash()).Hex())
+		"r", r.Number, "bn", r.chainHead.GetNumber(), "#head", Hash(r.chainHead.Hash()).Hex(), "method", r.config.ActivityMethod)
 
 	sort.Ints(r.activeSample)
 

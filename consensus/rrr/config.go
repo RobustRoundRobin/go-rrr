@@ -2,7 +2,12 @@ package rrr
 
 const (
 	RRRActiveMethodSortEndorsers = "sortendorsers"
-	RRRActiveMethodSampleAged    = "sampleaged"
+	// RRRActiveMethodRotateCandidates is implemented as a variant on
+	// sortendorsers where rather than idling leaders that fail to produce
+	// within Nc, we 'rotate' the candidate selection through the active
+	// selection acording to the number of failed rounds.
+	RRRActiveMethodRotateCandidates = "rotatecandidates"
+	RRRActiveMethodSampleAged       = "sampleaged"
 )
 
 // Config carries the RRR consensus configuration

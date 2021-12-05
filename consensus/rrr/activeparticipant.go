@@ -55,6 +55,7 @@ func (p *Participant) oldestForIdleRule(icandidate int, roundNumber, idleRoundLi
 	}
 
 	if p.candidateRound == 0 {
+		p.candidateRound = roundNumber
 		return false
 	}
 
@@ -65,7 +66,7 @@ func (p *Participant) oldestForIdleRule(icandidate int, roundNumber, idleRoundLi
 
 	p.candidateRound = roundNumber
 
-	return p.failedRounds > idleRoundLimit
+	return p.failedRounds >= idleRoundLimit
 }
 
 type ParticipantByAge []*Participant

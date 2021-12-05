@@ -477,13 +477,17 @@ func (a *activeList) AccumulateActive(
 
 		// Do any enrolments. (Re) Enrolling an identity moves it to the
 		// youngest position in the activity set
-		a.enrolIdentities(
+		youngestKnown, err = a.enrolIdentities(
 			chainID, youngestKnown,
 			blockActivity.SealerID, blockActivity.SealerPub, blockActivity.Enrol,
 			h, hseal, curNumber, curRound)
 
+		if err != nil {
+			return err
+		}
+
 		// The sealer is the oldest of those identities active for this block and so is added last.
-		a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, curRound, 0)
+		youngestKnown = a.refreshAge(youngestKnown, blockActivity.SealerID, h, curNumber, curRound, 0)
 
 		// The endorsers are active, they do not move in the age ordering.
 		// Note however, for any identity enrolled after genesis, as we are
@@ -1011,7 +1015,7 @@ func (a *idActivity) lastActiveBlock() uint64 {
 func (a *activeList) enrolIdentities(
 	chainID Hash, fence *list.Element, sealerID Hash,
 	sealerPub []byte, enrolments []Enrolment, block Hash, blockSeal Hash, blockNumber, roundNumber uint64,
-) error {
+) (*list.Element, error) {
 
 	enbind := EnrolmentBinding{}
 
@@ -1068,15 +1072,15 @@ func (a *activeList) enrolIdentities(
 		var err error
 
 		if ok, err = verifyEnrolment(enr, true); err != nil {
-			return err
+			return fence, err
 		}
 		if !ok {
 			if ok, err = verifyEnrolment(enr, false); err != nil {
-				return err
+				return fence, err
 			}
 		}
 		if !ok {
-			return fmt.Errorf("sealer-id=`%s',id=`%s',u=`%s':%w",
+			return fence, fmt.Errorf("sealer-id=`%s',id=`%s',u=`%s':%w",
 				sealerID.Hex(), enr.ID.Hex(), enr.U.Hex(), errEnrolmentInvalid)
 		}
 
@@ -1091,9 +1095,9 @@ func (a *activeList) enrolIdentities(
 		}
 		a.logger.Debug("RRR enroled identity", "id", enr.ID.Hex(), "o", order, "bn", blockNumber, "r", roundNumber, "#", block.Hex())
 
-		a.refreshAge(fence, enr.ID, block, blockNumber, roundNumber, order)
+		fence = a.refreshAge(fence, enr.ID, block, blockNumber, roundNumber, order)
 	}
-	return nil
+	return fence, nil
 }
 
 func newIDActivity(nodeID Hash) *idActivity {
@@ -1143,12 +1147,17 @@ func (a *activeList) recordActivity(nodeID Hash, endorsed Hash, blockNumber, rou
 // 'older' than the previous
 func (a *activeList) refreshAge(
 	fence *list.Element, nodeID Hash, block Hash, blockNumber, roundNumber uint64, order int,
-) {
+) *list.Element {
 	var aged *idActivity
 
 	nodeAddr := nodeID.Address()
 
 	if el := a.aged[nodeAddr]; el != nil {
+
+		// the case where an identity matching the fence mines or endorses
+		if fence == el {
+			fence = fence.Next() // older position (closer to front)
+		}
 
 		aged = el.Value.(*idActivity)
 
@@ -1215,4 +1224,5 @@ func (a *activeList) refreshAge(
 	if blockNumber == 0 {
 		aged.genesisOrder = order
 	}
+	return fence
 }
