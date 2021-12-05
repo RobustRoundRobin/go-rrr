@@ -1,0 +1,49 @@
+---
+version: '3'
+
+env:
+  # The following to are specific to go-rrr ci/cd
+  SKAFFOLD_DEFAULT_REPO: "eu.gcr.io/fetlar-1"
+  TAG: "fetlar-latest"
+  # PROFILE: "cloud"
+  PROFILE: ""
+
+vars:
+  QUORUM_REPO: git@github.com:RobustRoundRobin/quorum.git
+  BUILD_ROOT: ".."
+  QUORUM_SRC: "{{.BUILD_ROOT}}/quorum"
+  DOCKERINGORE_USER: "{{.BUILD_ROOT}}/.dockerignore-$USER"
+
+tasks:
+  clonequorum:
+    desc: 'ensure the quorum fork is cloned to the expected location'
+    cmds:
+      - |
+        [ -d {{.QUORUM_SRC}}/.git ] && echo "found at {{.QUORUM_SRC}}" && exit 0
+        git clone {{.QUORUM_REPO}} {{.QUORUM_SRC}}
+
+  buildprepare:
+    desc: 'prepare the BUILD_ROOT'
+    cmds:
+      - |
+        cp -v cicd/buildcontext/skaffold.yaml {{.BUILD_ROOT}}/
+        cp -v cicd/buildcontext/Dockerfile {{.BUILD_ROOT}}/
+        cp -v cicd/buildcontext/Dockerfile-rrrctl {{.BUILD_ROOT}}/
+        cp -v cicd/buildcontext/.dockerignore {{.BUILD_ROOT}}/
+        [ -f {{.DOCKERINGORE_USER }} ] && cat {{.DOCKERINGORE_USER }} >> {{.BUILD_ROOT}}/.dockerignore && echo "personalised dockerignores"
+
+  build:
+    desc: 'build a geth client including support for rrr'
+    deps: [buildprepare]
+    cmds:
+      - |
+        pushd {{.BUILD_ROOT}}
+        CMD="skaffold build ${PROFILE:+-p $PROFILE} ${TAG:+-t $TAG}"
+        echo $CMD && $CMD
+
+  test:
+    desc: 'run unittests'
+    cmds:
+      - |
+        cd tools
+        go test -timeout 300s -v github.com/RobustRoundRobin/go-rrr/tools
