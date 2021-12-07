@@ -347,6 +347,8 @@ func (r *EndorsmentProtocol) PrimeActiveSelection(chain EngineChainReader) error
 		fallthrough
 	case RRRActiveMethodSortEndorsers:
 		r.a = NewActiveSelection3(r.config, r.codec, r.nodeID, r.logger)
+	default:
+		return fmt.Errorf("unknown activitymethod: %s", r.config.ActivityMethod)
 	}
 
 	header := chain.CurrentHeader()

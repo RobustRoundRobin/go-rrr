@@ -7,8 +7,6 @@ env:
   TAG: "fetlar-latest"
   # PROFILE: "cloud"
   PROFILE: ""
-
-vars:
   QUORUM_REPO: git@github.com:RobustRoundRobin/quorum.git
   BUILD_ROOT: ".."
   QUORUM_SRC: "{{.BUILD_ROOT}}/quorum"

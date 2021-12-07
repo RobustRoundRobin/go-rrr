@@ -6,7 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"fmt"
-
+    // TODO: use git@github.com:ConsenSys/goquorum-crypto-secp256k1.git
 	"github.com/ethereum/go-ethereum/crypto/secp256k1" // see go.mod this is 'replaced'
 	"golang.org/x/crypto/sha3"
 )
