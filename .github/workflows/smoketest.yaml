@@ -12,7 +12,7 @@ jobs:
   raft:
     uses: robinbryce/benchblock/.github/workflows/loadtest-on-gcp.yaml@main
     with:
-      project_id: "fetlar-1"
+      project_id: "iona-1"
       location: "europe-west2-a"
       cluster_name: "kluster"
       consensus: raft
@@ -21,12 +21,12 @@ jobs:
       maxwait: "360"
 
     secrets:
-      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
+      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_IONA }}
 
   ibft:
     uses: robinbryce/benchblock/.github/workflows/loadtest-on-gcp.yaml@main
     with:
-      project_id: "fetlar-1"
+      project_id: "iona-1"
       location: "europe-west2-a"
       cluster_name: "kluster"
       consensus: "ibft"
@@ -36,12 +36,12 @@ jobs:
       maxwait: "360"
 
     secrets:
-      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
+      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_IONA }}
 
   rrr:
     uses: robinbryce/benchblock/.github/workflows/loadtest-on-gcp.yaml@main
     with:
-      project_id: "fetlar-1"
+      project_id: "iona-1"
       location: "europe-west2-a"
       cluster_name: "kluster"
       consensus: "rrr"
@@ -51,4 +51,4 @@ jobs:
       maxwait: "360"
 
     secrets:
-      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_FETLAR }}
+      gcp_project_key: ${{ secrets.GCP_PROJECT_KEY_IONA }}
