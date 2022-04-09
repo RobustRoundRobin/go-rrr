@@ -387,6 +387,8 @@ func (r *EndorsmentProtocol) setChainHead(chain EngineChainReader, head BlockHea
 		if err != nil {
 			return err
 		}
+
+		r.logger.Info("RRR setChainHead - since sealed", "d", time.Since(r.chainHeadSealTime))
 	}
 
 	// Establish the round of the chain head. The genesis block is round 0.
