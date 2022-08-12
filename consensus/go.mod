@@ -1,4 +1,4 @@
-module github.com/RobustRoundRobin/go-rrr/consensus/rrr
+module github.com/RobustRoundRobin/go-rrr/consensus
 
 go 1.15
 
