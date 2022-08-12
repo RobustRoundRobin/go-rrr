@@ -9,10 +9,6 @@ build:
   artifacts:
     - image: geth-rrr
       context: .
-    - image: rrr-delve
-      context: .
-      docker:
-        dockerfile: Dockerfile-delve
 profiles:
   - name: cloud
     build:

@@ -8,7 +8,7 @@
 #
 # Our tusk.yml build step uses rsync to maintain a buildcontext in ${workdir}
 
-FROM golang:1.15-buster as go-builder
+FROM golang:1.16-buster as go-builder
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
   && apt-get upgrade -y --no-install-recommends \
   && apt-get install -y \

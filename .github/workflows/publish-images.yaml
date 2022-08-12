@@ -20,12 +20,19 @@ jobs:
         uses: actions/checkout@v2
         with:
           repository: RobustRoundRobin/quorum
+          ref: rrr-consensus
           path: quorum
+
           token: ${{ github.token }}
       -
         name: copy buildcontext files
         run: |
           cp go-rrr/cicd/buildcontext/* $GITHUB_WORKSPACE/
+      -
+        name: patch go.mod for go-rrr local build
+        run: |
+          sed -i '6 i replace github.com/RobustRoundRobin/go-rrr/consensus => ../go-rrr/consensus' \
+            quorum/go.mod
       -
         name: Login to dockerhub
         if: github.event_name != 'pull_request'
