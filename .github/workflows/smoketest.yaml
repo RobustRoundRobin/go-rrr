@@ -41,6 +41,8 @@ jobs:
   rrr:
     uses: robinbryce/benchblock/.github/workflows/loadtest-on-gcp.yaml@main
     with:
+      geth_image: 'robustroundrobin/geth:master'
+      rrrctl_image: 'robustroundrobin/rrrctl:master'
       project_id: "iona-1"
       location: "europe-west2-a"
       cluster_name: "kluster"
