@@ -575,6 +575,22 @@ func (r *EndorsmentProtocol) setRoundForTime(now time.Time) (time.Duration, bool
 // go:
 // 	https://golang.org/pkg/time/#hdr-Monotonic_Clocks
 // 	https://go.googlesource.com/proposal/+/master/design/12914-monotonic.md
+//
+// NOTICE: We define all rounds up until the first block is produced as being
+// seeded by the genesis state. Absent this consideration we would be forced to
+// sample the DRGB an arbitrary number of times when the network (and any node)
+// starts - to account for  the time elapsed between the creation of the genesis
+// document and the start time.
+//
+// a. If the node is joining an existing network  it will be ignored until it
+// recieves the first block and updates its state accordingly
+// b. If the network is doing a cold start, only the genesis identities can be
+// involved. In this implementation those are necessarily trusted to boot strap
+// the network.
+//
+// Until the first block is produced there can be no possibility of random bias.
+// We assume that (sooner or later) the committee and leaders in the initial
+// selections will become live.
 func (r *EndorsmentProtocol) alignFailedAttempts(
 	now time.Time, rh uint64, fprevious uint32, // from current round (or zero if NewChainHead)
 ) uint32 {
@@ -623,6 +639,23 @@ func (r *EndorsmentProtocol) alignFailedAttempts(
 		r.logger.Debug(
 			"RRR alignFailedAttempts - noop, a < ne",
 			"a", r.a.NumActive())
+		return f
+	}
+
+	// Allowance for network and node startup. Otherwise the time the genesis
+	// document was created determins the number of samples we have to take here.
+	if rh == 0 {
+		r.logger.Debug("RRR DRBG - skipping catchup round %d. waiting for first block", f)
+		if r.selectionRand.NumSamplesRead() == 0 {
+			r.logger.Debug("RRR DRGB - initialise genesis active sample from round 1")
+			r.activeSample = r.a.NextActiveSample(1, r.selectionRand, r.activeSample)
+		}
+		r.logger.Debug(
+			"RRR DRGB pending first block ...",
+			"r", r.Number, "ns", r.selectionRand.NumSamplesRead(), "s", r.activeSample,
+			"a", r.a.NumActive(), "df", f-fprevious, "f", f,
+			"th", r.chainHeadRoundStart.Truncate(time.Millisecond).UnixNano(),
+			"bn", r.chainHead.GetNumber(), "br", r.chainHeadRound, "#", Hash(r.chainHead.Hash()).Hex())
 		return f
 	}
 

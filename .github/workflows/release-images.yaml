@@ -14,6 +14,13 @@ jobs:
     steps:
 
       -
+        name: checkout go-rrr
+        uses: actions/checkout@v2
+        with:
+          path: go-rrr
+          token: ${{ github.token }}
+
+      -
         name: finalise env
         run: |
           # The quorum fork repo should be tagged before releasing go-rrr with the
@@ -22,14 +29,8 @@ jobs:
           # that final release fails for an intermitent reason that requires a fixup,
           # force retag the fixup or start again with a new tag
           echo "QUORUM_RRR_VERSION=${GITHUB_REF_NAME%-*}" >> $GITHUB_ENV
-          tail -n 1 $GITHUB_ENV
-
-      -
-        name: checkout go-rrr
-        uses: actions/checkout@v2
-        with:
-          path: go-rrr
-          token: ${{ github.token }}
+          echo "GO_RRR_MOD_VERSION=$(git describe --tags --abbrev=0) >> $GITHUB_ENV
+          tail -n 2 $GITHUB_ENV
 
       -
         name: checkout quorum

@@ -32,7 +32,7 @@ jobs:
       -
         name: patch go.mod for go-rrr local build
         run: |
-          sed -i '6 i replace github.com/RobustRoundRobin/go-rrr/consensus => ../go-rrr/consensus' \
+          sed -i 's#//.*\(replace github.com/RobustRoundRobin/go-rrr/consensus =>\).*#\1  ../go-rrr/consensus#g' \
             quorum/go.mod
       -
         name: Login to dockerhub
