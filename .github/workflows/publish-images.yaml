@@ -1,6 +1,7 @@
 name: Build and publish geth-rrr image -x
 env:
   DOCKERHUB_USERNAME: robinbryce
+  QUORUM_VERSION: v22.7.0
 on: [push]
 jobs:
   build-and-publish-images:
@@ -48,9 +49,9 @@ jobs:
           images: robustroundrobin/geth
           tags: |
             type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern=${{QUORUM_VERSION}}-rrr.{{version}}
       -
         name: Build and push geth
         uses: docker/build-push-action@v2
@@ -67,9 +68,9 @@ jobs:
           images: robustroundrobin/rrrctl
           tags: |
             type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern=${{QUORUM_VERSION}}-rrr.{{version}}
 
       -
         name: Build and push rrrctl
