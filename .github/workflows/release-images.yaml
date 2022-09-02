@@ -1,7 +1,7 @@
 name: Build and release geth-rrr image -x
 env:
   DOCKERHUB_USERNAME: robinbryce
-  QUORUM_VERSION: v21.10.0
+  QUORUM_VERSION: v22.7.0
 on:
   workflow_dispatch: []
   release:
