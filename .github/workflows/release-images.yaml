@@ -58,7 +58,7 @@ jobs:
           images: robustroundrobin/geth
           tags: |
             type=ref,event=branch
-            type=semver,pattern=${{QUORUM_VERSION}}-rrr.{{version}}
+            type=semver,pattern=${{ env.QUORUM_VERSION }}-rrr.{{version}}
             type=sha,prefix=rrr-{{branch}}sha-
       -
         name: Build and push geth
@@ -76,7 +76,7 @@ jobs:
           images: robustroundrobin/rrrctl
           tags: |
             type=ref,event=branch
-            type=semver,pattern=${{QUORUM_VERSION}}-rrr.{{version}}
+            type=semver,pattern=${{ env.QUORUM_VERSION }}-rrr.{{version}}
             type=sha,prefix=rrr-{{branch}}sha-
 
       -
