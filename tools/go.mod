@@ -10,7 +10,7 @@ replace (
 )
 
 require (
-	github.com/RobustRoundRobin/go-rrr/consensus v0.1.5
+	github.com/RobustRoundRobin/go-rrr/consensus v0.1.6
 	github.com/RobustRoundRobin/go-rrr/secp256k1suite v0.0.0-00010101000000-000000000000
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/ethereum/go-ethereum v1.10.8
